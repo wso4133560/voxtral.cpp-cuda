@@ -4,6 +4,9 @@
 #ifdef GGML_USE_METAL
 #include "ggml-metal.h"
 #endif
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -119,6 +122,7 @@ struct voxtral_model {
     ggml_backend_buffer_t buf_weights = nullptr;
     ggml_backend_t         backend_weights = nullptr;
     bool                   weights_on_metal = false;
+    bool                   weights_on_cuda = false;
 };
 
 // ============================================================================
@@ -598,6 +602,15 @@ voxtral_model * voxtral_model_load_from_file(
     voxtral_log_callback   logger,
     bool                   use_metal)
 {
+    return voxtral_model_load_from_file_ex(path, logger, use_metal, false);
+}
+
+voxtral_model * voxtral_model_load_from_file_ex(
+    const std::string    & path,
+    voxtral_log_callback   logger,
+    bool                   use_metal,
+    bool                   use_cuda)
+{
     auto log_info = [&](const std::string & msg) {
         if (logger) logger(voxtral_log_level::info, msg);
     };
@@ -623,11 +636,30 @@ voxtral_model * voxtral_model_load_from_file(
 
     // Allocate a backend buffer for all the weights
     ggml_backend_t weights_backend = nullptr;
+#ifdef GGML_USE_CUDA
+    if (use_cuda) {
+        weights_backend = ggml_backend_cuda_init(0);  // Use device 0
+        if (!weights_backend) {
+            fprintf(stderr, "voxtral: ggml_backend_cuda_init() failed, falling back to CPU\n");
+        } else {
+            log_info("weights backend: CUDA");
+            model->weights_on_metal = false;
+            model->weights_on_cuda = true;
+        }
+    }
+#else
+    if (use_cuda) {
+        fprintf(stderr, "voxtral: CUDA backend not available in this build, using CPU\n");
+    }
+#endif
 #ifdef GGML_USE_METAL
-    if (use_metal) {
+    if (!weights_backend && use_metal) {
         weights_backend = ggml_backend_metal_init();
         if (!weights_backend) {
             fprintf(stderr, "voxtral: ggml_backend_metal_init() failed, falling back to CPU\n");
+        } else {
+            model->weights_on_metal = true;
+            model->weights_on_cuda = false;
         }
     }
 #else
@@ -638,10 +670,10 @@ voxtral_model * voxtral_model_load_from_file(
     if (!weights_backend) {
         weights_backend = ggml_backend_cpu_init();
         use_metal = false;
+        use_cuda = false;
     }
 
     model->backend_weights = weights_backend;
-    model->weights_on_metal = use_metal;
     model->buf_weights = ggml_backend_alloc_ctx_tensors(ctx_meta, weights_backend);
 
     if (!model->buf_weights) {
@@ -822,10 +854,19 @@ voxtral_context * voxtral_init_from_model(
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
     // Select backend
+    bool want_cuda = params.use_cuda || (model && model->weights_on_cuda);
     bool want_metal = params.use_metal || (model && model->weights_on_metal);
 
+#ifdef GGML_USE_CUDA
+    if (want_cuda) {
+        ctx->backend = ggml_backend_cuda_init(0);  // Use device 0
+        if (!ctx->backend) {
+            LOG_WARN(ctx, "failed to initialize CUDA backend, falling back to CPU");
+        }
+    }
+#endif
 #ifdef GGML_USE_METAL
-    if (want_metal) {
+    if (!ctx->backend && want_metal) {
         ctx->backend = ggml_backend_metal_init();
         if (!ctx->backend) {
             LOG_WARN(ctx, "failed to initialize Metal backend, falling back to CPU");
@@ -845,7 +886,14 @@ voxtral_context * voxtral_init_from_model(
     } else {
         ctx->backend_cpu = ggml_backend_cpu_init();
         ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
-        LOG_INFO(ctx, "backend: METAL (CPU fallback %d threads)", ctx->n_threads);
+#ifdef GGML_USE_CUDA
+        if (want_cuda && ggml_backend_is_cuda(ctx->backend)) {
+            LOG_INFO(ctx, "backend: CUDA (CPU fallback %d threads)", ctx->n_threads);
+        } else
+#endif
+        {
+            LOG_INFO(ctx, "backend: METAL (CPU fallback %d threads)", ctx->n_threads);
+        }
     }
 
     // Allocate persistent tensors for encoder output, decoder memory, KV cache, logits
@@ -960,14 +1008,18 @@ static void clear_kv_cache(voxtral_context * ctx) {
     if (!ctx || !ctx->kv_self_k || !ctx->kv_self_v) {
         return;
     }
-    void * k_data = ggml_get_data(ctx->kv_self_k);
-    void * v_data = ggml_get_data(ctx->kv_self_v);
-    if (k_data) {
-        memset(k_data, 0, ggml_nbytes(ctx->kv_self_k));
-    }
-    if (v_data) {
-        memset(v_data, 0, ggml_nbytes(ctx->kv_self_v));
-    }
+
+    // Use backend-agnostic clearing instead of direct memset
+    // This works for both CPU and GPU backends
+    const size_t k_size = ggml_nbytes(ctx->kv_self_k);
+    const size_t v_size = ggml_nbytes(ctx->kv_self_v);
+
+    std::vector<uint8_t> zeros_k(k_size, 0);
+    std::vector<uint8_t> zeros_v(v_size, 0);
+
+    ggml_backend_tensor_set(ctx->kv_self_k, zeros_k.data(), 0, k_size);
+    ggml_backend_tensor_set(ctx->kv_self_v, zeros_v.data(), 0, v_size);
+
     ctx->kv_used = 0;
 }
 
@@ -981,18 +1033,23 @@ static void kv_cache_shift_left(voxtral_context * ctx, int32_t shift) {
         return;
     }
 
-    uint8_t * k_data = (uint8_t *) ggml_get_data(ctx->kv_self_k);
-    uint8_t * v_data = (uint8_t *) ggml_get_data(ctx->kv_self_v);
-    if (!k_data || !v_data) {
-        return;
-    }
-
+    // For GPU backends, we need to use backend-agnostic operations
     const size_t row_bytes = ctx->kv_self_k->nb[1];
     const size_t layer_stride = ctx->kv_self_k->nb[2];
+    const size_t total_bytes = ggml_nbytes(ctx->kv_self_k);
 
+    // Allocate temporary buffers
+    std::vector<uint8_t> k_temp(total_bytes);
+    std::vector<uint8_t> v_temp(total_bytes);
+
+    // Read current KV cache from backend
+    ggml_backend_tensor_get(ctx->kv_self_k, k_temp.data(), 0, total_bytes);
+    ggml_backend_tensor_get(ctx->kv_self_v, v_temp.data(), 0, total_bytes);
+
+    // Perform shift on CPU
     for (int32_t l = 0; l < VOXTRAL_DEC_LAYERS; ++l) {
-        uint8_t * k_base = k_data + (size_t) l * layer_stride;
-        uint8_t * v_base = v_data + (size_t) l * layer_stride;
+        uint8_t * k_base = k_temp.data() + (size_t) l * layer_stride;
+        uint8_t * v_base = v_temp.data() + (size_t) l * layer_stride;
 
         memmove(k_base, k_base + (size_t) shift * row_bytes, (size_t) (window - shift) * row_bytes);
         memmove(v_base, v_base + (size_t) shift * row_bytes, (size_t) (window - shift) * row_bytes);
@@ -1000,6 +1057,10 @@ static void kv_cache_shift_left(voxtral_context * ctx, int32_t shift) {
         memset(k_base + (size_t) (window - shift) * row_bytes, 0, (size_t) shift * row_bytes);
         memset(v_base + (size_t) (window - shift) * row_bytes, 0, (size_t) shift * row_bytes);
     }
+
+    // Write back to backend
+    ggml_backend_tensor_set(ctx->kv_self_k, k_temp.data(), 0, total_bytes);
+    ggml_backend_tensor_set(ctx->kv_self_v, v_temp.data(), 0, total_bytes);
 }
 
 // ============================================================================

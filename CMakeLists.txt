@@ -72,6 +72,9 @@ if(VOXTRAL_AUTO_DETECT_BLAS)
     endif()
 endif()
 
+# CUDA support
+option(GGML_CUDA "ggml: use CUDA" OFF)
+
 add_subdirectory(ggml)
 
 add_library(voxtral_lib
@@ -105,6 +108,27 @@ target_link_libraries(voxtral PRIVATE voxtral_lib)
 
 add_executable(voxtral-quantize src/voxtral-quantize.cpp)
 target_link_libraries(voxtral-quantize PRIVATE ggml Threads::Threads m dl)
+
+# Real-time transcription client (requires PulseAudio)
+find_package(PkgConfig)
+if(PKG_CONFIG_FOUND)
+    pkg_check_modules(PULSEAUDIO libpulse-simple)
+    if(PULSEAUDIO_FOUND)
+        add_executable(voxtral-realtime src/voxtral-realtime.cpp)
+        target_link_libraries(voxtral-realtime PRIVATE voxtral_lib ${PULSEAUDIO_LIBRARIES})
+        target_include_directories(voxtral-realtime PRIVATE ${PULSEAUDIO_INCLUDE_DIRS})
+
+        # Optimized version with advanced features
+        add_executable(voxtral-realtime-opt src/voxtral-realtime-optimized.cpp)
+        target_link_libraries(voxtral-realtime-opt PRIVATE voxtral_lib ${PULSEAUDIO_LIBRARIES})
+        target_include_directories(voxtral-realtime-opt PRIVATE ${PULSEAUDIO_INCLUDE_DIRS})
+
+        message(STATUS "Building voxtral-realtime with PulseAudio support")
+        message(STATUS "Building voxtral-realtime-opt (optimized version)")
+    else()
+        message(STATUS "PulseAudio not found, skipping voxtral-realtime")
+    endif()
+endif()
 
 if(VOXTRAL_WARNINGS_AS_ERRORS)
     if (MSVC)

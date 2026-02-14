@@ -97,6 +97,7 @@ struct voxtral_context_params {
     voxtral_log_level    log_level  = voxtral_log_level::info;
     voxtral_log_callback logger     = nullptr;
     bool                 use_metal  = false;
+    bool                 use_cuda   = false;
 };
 
 // ============================================================================
@@ -123,6 +124,12 @@ voxtral_model * voxtral_model_load_from_file(
     const std::string    & path,
     voxtral_log_callback   logger = nullptr,
     bool                   use_metal = false);
+
+voxtral_model * voxtral_model_load_from_file_ex(
+    const std::string    & path,
+    voxtral_log_callback   logger,
+    bool                   use_metal,
+    bool                   use_cuda);
 
 void voxtral_model_free(voxtral_model * model);
 
