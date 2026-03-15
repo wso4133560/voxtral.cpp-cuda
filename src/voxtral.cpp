@@ -150,6 +150,7 @@ struct voxtral_context {
     ggml_tensor * decoder_memory  = nullptr;  // [dec_dim, max_dec_seq]
     ggml_tensor * decoder_logits  = nullptr;  // [vocab_size]
     ggml_tensor * decoder_next_token = nullptr; // [1] int32 argmax from decoder step
+    ggml_tensor * decoder_time_emb = nullptr; // [dec_dim] constant diffusion time embedding
 
     // KV cache: [kv_heads*head_dim, dec_window, dec_layers]
     ggml_tensor * kv_self_k       = nullptr;
@@ -173,6 +174,7 @@ struct voxtral_context {
     std::vector<float> hann_window;     // [window_size]
     std::vector<float> mel_filters_cpu; // [n_freq * n_mel]
     std::vector<float> time_emb_cpu;    // [dec_dim]
+    std::vector<uint8_t> dec_step_meta_buf;
 
 };
 
@@ -907,7 +909,7 @@ voxtral_context * voxtral_init_from_model(
 
     // Allocate persistent tensors for encoder output, decoder memory, KV cache, logits
     {
-        constexpr size_t n_tensors = 6;
+        constexpr size_t n_tensors = 7;
         ggml_init_params p = {
             /*.mem_size  =*/ ggml_tensor_overhead() * n_tensors,
             /*.mem_buffer=*/ nullptr,
@@ -932,6 +934,9 @@ voxtral_context * voxtral_init_from_model(
 
         ctx->decoder_next_token = ggml_new_tensor_1d(ctx->ctx_persistent, GGML_TYPE_I32, 1);
         ggml_set_name(ctx->decoder_next_token, "decoder_next_token");
+
+        ctx->decoder_time_emb = ggml_new_tensor_1d(ctx->ctx_persistent, GGML_TYPE_F32, VOXTRAL_DEC_DIM);
+        ggml_set_name(ctx->decoder_time_emb, "decoder_time_emb");
 
         // KV cache: [kv_dim, dec_window, dec_layers]
         const int32_t kv_dim = VOXTRAL_DEC_KV_HEADS * VOXTRAL_DEC_HEAD_DIM;  // 1024
@@ -994,6 +999,7 @@ voxtral_context * voxtral_init_from_model(
 
     // Time embedding for t = N_DELAY_TOKENS
     compute_time_embedding(ctx->time_emb_cpu, (float)VOXTRAL_N_DELAY_TOKENS, VOXTRAL_DEC_DIM);
+    ggml_backend_tensor_set(ctx->decoder_time_emb, ctx->time_emb_cpu.data(), 0, VOXTRAL_DEC_DIM * sizeof(float));
 
     LOG_INFO(ctx, "context initialized");
     return ctx;
@@ -1587,10 +1593,7 @@ static ggml_cgraph * build_decoder_prefill_graph(
     ggml_set_name(positions, "positions");
     ggml_backend_sched_set_tensor_backend(ctx->sched_dec_pre, positions, ctx->backend);
 
-    // Time embedding: [dec_dim]
-    ggml_tensor * time_emb = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, VOXTRAL_DEC_DIM);
-    ggml_set_name(time_emb, "time_emb");
-    ggml_backend_sched_set_tensor_backend(ctx->sched_dec_pre, time_emb, ctx->backend);
+    ggml_tensor * time_emb = ctx->decoder_time_emb; // [dec_dim] persistent backend tensor
 
     // Token embeddings: [dec_dim, n_tokens]
     ggml_tensor * tok_emb = ggml_get_rows(gctx, model->tok_embeddings_weight, token_ids); // [dec_dim, n_tokens]
@@ -1644,8 +1647,7 @@ static ggml_cgraph * build_decoder_step_graph(
     int32_t               audio_pos,   // position in audio embeddings (may differ)
     bool                  store_logits,
     ggml_tensor       **  token_id_out,
-    ggml_tensor       **  pos_tensor_out,
-    ggml_tensor       **  time_emb_out)
+    ggml_tensor       **  pos_tensor_out)
 {
     voxtral_model * model = ctx->model;
     ggml_cgraph * gf = ggml_new_graph_custom(gctx, GGML_DEFAULT_GRAPH_SIZE * 4, false);
@@ -1661,10 +1663,7 @@ static ggml_cgraph * build_decoder_step_graph(
     ggml_set_name(pos_tensor, "position");
     ggml_backend_sched_set_tensor_backend(ctx->sched_dec_step, pos_tensor, ctx->backend);
 
-    // Time embedding: [dec_dim]
-    ggml_tensor * time_emb = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, VOXTRAL_DEC_DIM);
-    ggml_set_name(time_emb, "time_emb");
-    ggml_backend_sched_set_tensor_backend(ctx->sched_dec_step, time_emb, ctx->backend);
+    ggml_tensor * time_emb = ctx->decoder_time_emb; // [dec_dim] persistent backend tensor
 
     // Token embedding: [dec_dim, 1]
     ggml_tensor * tok_emb = ggml_get_rows(gctx, model->tok_embeddings_weight, token_id); // [dec_dim, 1]
@@ -1705,9 +1704,6 @@ static ggml_cgraph * build_decoder_step_graph(
     if (pos_tensor_out) {
         *pos_tensor_out = pos_tensor;
     }
-    if (time_emb_out) {
-        *time_emb_out = time_emb;
-    }
 
     return gf;
 }
@@ -1729,11 +1725,13 @@ static bool run_encoder(voxtral_context * ctx, const float * mel_data, int32_t n
 
     const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
                              ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
-    std::vector<uint8_t> meta_buf(meta_size);
+    if (ctx->dec_step_meta_buf.size() != meta_size) {
+        ctx->dec_step_meta_buf.resize(meta_size);
+    }
 
     ggml_init_params p = {
         /*.mem_size  =*/ meta_size,
-        /*.mem_buffer=*/ meta_buf.data(),
+        /*.mem_buffer=*/ ctx->dec_step_meta_buf.data(),
         /*.no_alloc  =*/ true,
     };
     ggml_context * gctx = ggml_init(p);
@@ -1898,11 +1896,6 @@ static bool run_decoder_prefill(
         ggml_backend_tensor_set(pos_t, pos.data(), 0, n_tokens * sizeof(int32_t));
     }
 
-    ggml_tensor * time_t = find_tensor_in_graph(gf, "time_emb");
-    if (time_t) {
-        ggml_backend_tensor_set(time_t, ctx->time_emb_cpu.data(), 0, VOXTRAL_DEC_DIM * sizeof(float));
-    }
-
     // Set causal mask: lower-triangular (0 for allowed, -inf for masked)
     ggml_tensor * mask_t = find_tensor_in_graph(gf, "causal_mask");
     if (mask_t) {
@@ -1923,8 +1916,6 @@ static bool run_decoder_prefill(
     }
 
     ctx->kv_used = std::min(n_tokens, VOXTRAL_DEC_WINDOW);
-
-    ggml_backend_sched_reset(ctx->sched_dec_pre);
     ggml_free(gctx);
 
     LOG_INFO(ctx, "decoder prefill done");
@@ -1961,9 +1952,8 @@ static bool run_decoder_step(
 
     ggml_tensor * tok_t = nullptr;
     ggml_tensor * pos_t = nullptr;
-    ggml_tensor * time_t = nullptr;
     ggml_cgraph * gf = build_decoder_step_graph(
-        ctx, gctx, position, audio_pos, logits_out != nullptr, &tok_t, &pos_t, &time_t);
+        ctx, gctx, position, audio_pos, logits_out != nullptr, &tok_t, &pos_t);
     log_graph_info(ctx, "decoder step", gf);
 
     ggml_backend_sched_reset(ctx->sched_dec_step);
@@ -1982,10 +1972,6 @@ static bool run_decoder_step(
         ggml_backend_tensor_set(pos_t, &position, 0, sizeof(int32_t));
     }
 
-    if (time_t) {
-        ggml_backend_tensor_set(time_t, ctx->time_emb_cpu.data(), 0, VOXTRAL_DEC_DIM * sizeof(float));
-    }
-
     // Compute
     ggml_backend_sched_graph_compute(ctx->sched_dec_step, gf);
 
@@ -1998,8 +1984,6 @@ static bool run_decoder_step(
     }
 
     ctx->kv_used += 1;
-
-    ggml_backend_sched_reset(ctx->sched_dec_step);
     ggml_free(gctx);
 
     return true;
@@ -2023,20 +2007,21 @@ static bool run_decoder_step_token_only(
 
     const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
                              ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
-    std::vector<uint8_t> meta_buf(meta_size);
+    if (ctx->dec_step_meta_buf.size() != meta_size) {
+        ctx->dec_step_meta_buf.resize(meta_size);
+    }
 
     ggml_init_params p = {
         /*.mem_size  =*/ meta_size,
-        /*.mem_buffer=*/ meta_buf.data(),
+        /*.mem_buffer=*/ ctx->dec_step_meta_buf.data(),
         /*.no_alloc  =*/ true,
     };
     ggml_context * gctx = ggml_init(p);
 
     ggml_tensor * tok_t = nullptr;
     ggml_tensor * pos_t = nullptr;
-    ggml_tensor * time_t = nullptr;
     ggml_cgraph * gf = build_decoder_step_graph(
-        ctx, gctx, position, audio_pos, false, &tok_t, &pos_t, &time_t);
+        ctx, gctx, position, audio_pos, false, &tok_t, &pos_t);
     log_graph_info(ctx, "decoder step(token-only)", gf);
 
     ggml_backend_sched_reset(ctx->sched_dec_step);
@@ -2054,17 +2039,11 @@ static bool run_decoder_step_token_only(
         ggml_backend_tensor_set(pos_t, &position, 0, sizeof(int32_t));
     }
 
-    if (time_t) {
-        ggml_backend_tensor_set(time_t, ctx->time_emb_cpu.data(), 0, VOXTRAL_DEC_DIM * sizeof(float));
-    }
-
     ggml_backend_sched_graph_compute(ctx->sched_dec_step, gf);
 
     ggml_backend_tensor_get(ctx->decoder_next_token, next_token_out, 0, sizeof(int32_t));
 
     ctx->kv_used += 1;
-
-    ggml_backend_sched_reset(ctx->sched_dec_step);
     ggml_free(gctx);
 
     return true;
