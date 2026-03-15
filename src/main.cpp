@@ -244,8 +244,17 @@ int main(int argc, char ** argv) {
         return 3;
     }
 
+    if (p.use_cuda && !voxtral_context_uses_cuda(*ctx)) {
+        std::cerr << "voxtral: requested --cuda but CUDA backend is unavailable; refusing CPU fallback\n";
+        voxtral_free(ctx);
+        voxtral_model_free(model);
+        return 5;
+    }
+
+    const bool want_first_step_logits = !p.dump_logits.empty() || !p.dump_logits_bin.empty();
+
     voxtral_result result;
-    if (!voxtral_transcribe_file(*ctx, p.audio, p.max_tokens, result)) {
+    if (!voxtral_transcribe_file(*ctx, p.audio, p.max_tokens, result, want_first_step_logits)) {
         voxtral_free(ctx);
         voxtral_model_free(model);
         return 4;

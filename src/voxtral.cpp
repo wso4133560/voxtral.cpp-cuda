@@ -33,6 +33,8 @@ static constexpr int32_t VOXTRAL_MAX_MEL_FRAMES = 4000;
 static constexpr int32_t VOXTRAL_MAX_ENC_SEQ = VOXTRAL_MAX_MEL_FRAMES / 2;  // after conv stride-2
 static constexpr int32_t VOXTRAL_MAX_DEC_SEQ = VOXTRAL_MAX_ENC_SEQ / VOXTRAL_DOWNSAMPLE_FACTOR;
 
+struct voxtral_context;
+
 // ============================================================================
 // Logging helper
 // ============================================================================
@@ -147,6 +149,7 @@ struct voxtral_context {
     ggml_tensor * encoder_output  = nullptr;  // [enc_dim, max_enc_seq]
     ggml_tensor * decoder_memory  = nullptr;  // [dec_dim, max_dec_seq]
     ggml_tensor * decoder_logits  = nullptr;  // [vocab_size]
+    ggml_tensor * decoder_next_token = nullptr; // [1] int32 argmax from decoder step
 
     // KV cache: [kv_heads*head_dim, dec_window, dec_layers]
     ggml_tensor * kv_self_k       = nullptr;
@@ -170,7 +173,13 @@ struct voxtral_context {
     std::vector<float> hann_window;     // [window_size]
     std::vector<float> mel_filters_cpu; // [n_freq * n_mel]
     std::vector<float> time_emb_cpu;    // [dec_dim]
+
 };
+
+static inline bool should_log(const voxtral_context * ctx, voxtral_log_level lvl) {
+    return ctx != nullptr && ctx->logger &&
+           static_cast<int>(lvl) <= static_cast<int>(ctx->log_level);
+}
 
 // ============================================================================
 // Mel filterbank computation (Slaney-style, matches Python reference)
@@ -898,7 +907,7 @@ voxtral_context * voxtral_init_from_model(
 
     // Allocate persistent tensors for encoder output, decoder memory, KV cache, logits
     {
-        constexpr size_t n_tensors = 5;
+        constexpr size_t n_tensors = 6;
         ggml_init_params p = {
             /*.mem_size  =*/ ggml_tensor_overhead() * n_tensors,
             /*.mem_buffer=*/ nullptr,
@@ -920,6 +929,9 @@ voxtral_context * voxtral_init_from_model(
         ctx->decoder_logits = ggml_new_tensor_1d(ctx->ctx_persistent, GGML_TYPE_F32,
             VOXTRAL_VOCAB_SIZE);
         ggml_set_name(ctx->decoder_logits, "decoder_logits");
+
+        ctx->decoder_next_token = ggml_new_tensor_1d(ctx->ctx_persistent, GGML_TYPE_I32, 1);
+        ggml_set_name(ctx->decoder_next_token, "decoder_next_token");
 
         // KV cache: [kv_dim, dec_window, dec_layers]
         const int32_t kv_dim = VOXTRAL_DEC_KV_HEADS * VOXTRAL_DEC_HEAD_DIM;  // 1024
@@ -1008,18 +1020,6 @@ static void clear_kv_cache(voxtral_context * ctx) {
     if (!ctx || !ctx->kv_self_k || !ctx->kv_self_v) {
         return;
     }
-
-    // Use backend-agnostic clearing instead of direct memset
-    // This works for both CPU and GPU backends
-    const size_t k_size = ggml_nbytes(ctx->kv_self_k);
-    const size_t v_size = ggml_nbytes(ctx->kv_self_v);
-
-    std::vector<uint8_t> zeros_k(k_size, 0);
-    std::vector<uint8_t> zeros_v(v_size, 0);
-
-    ggml_backend_tensor_set(ctx->kv_self_k, zeros_k.data(), 0, k_size);
-    ggml_backend_tensor_set(ctx->kv_self_v, zeros_v.data(), 0, v_size);
-
     ctx->kv_used = 0;
 }
 
@@ -1160,7 +1160,7 @@ static void log_tensor_info(voxtral_context * ctx, const char * tag, struct ggml
 }
 
 static void log_graph_info(voxtral_context * ctx, const char * name, struct ggml_cgraph * gf) {
-    if (gf == nullptr) {
+    if (gf == nullptr || !should_log(ctx, voxtral_log_level::info)) {
         return;
     }
     const int size  = ggml_graph_size(gf);
@@ -1571,7 +1571,8 @@ static ggml_tensor * build_decoder_layer(
 static ggml_cgraph * build_decoder_prefill_graph(
     voxtral_context     * ctx,
     ggml_context * gctx,
-    int32_t               n_tokens)  // number of prompt tokens
+    int32_t               n_tokens,  // number of prompt tokens
+    bool                  store_logits)
 {
     voxtral_model * model = ctx->model;
     ggml_cgraph * gf = ggml_new_graph_custom(gctx, GGML_DEFAULT_GRAPH_SIZE * 4, false);
@@ -1614,18 +1615,20 @@ static ggml_cgraph * build_decoder_prefill_graph(
             i, n_tokens, /*kv_offset=*/0, causal_mask);
     }
 
-    // Final norm
-    x = ggml_rms_norm(gctx, x, VOXTRAL_DEC_NORM_EPS); // [dec_dim, n_tokens]
-    x = ggml_mul(gctx, x, model->dec_norm_weight); // [dec_dim, n_tokens]
+    if (store_logits) {
+        // Final norm
+        x = ggml_rms_norm(gctx, x, VOXTRAL_DEC_NORM_EPS); // [dec_dim, n_tokens]
+        x = ggml_mul(gctx, x, model->dec_norm_weight); // [dec_dim, n_tokens]
 
-    // Logits for last token only: extract last token -> matmul with embeddings
-    ggml_tensor * last_hidden = ggml_view_1d(gctx, x, VOXTRAL_DEC_DIM,
-        (n_tokens - 1) * x->nb[1]); // [dec_dim]
+        // Logits for last token only: extract last token -> matmul with embeddings
+        ggml_tensor * last_hidden = ggml_view_1d(gctx, x, VOXTRAL_DEC_DIM,
+            (n_tokens - 1) * x->nb[1]); // [dec_dim]
 
-    ggml_tensor * logits = ggml_mul_mat(gctx, model->tok_embeddings_weight, last_hidden); // [vocab_size]
+        ggml_tensor * logits = ggml_mul_mat(gctx, model->tok_embeddings_weight, last_hidden); // [vocab_size]
 
-    // Copy logits to persistent
-    ggml_build_forward_expand(gf, ggml_cpy(gctx, logits, ctx->decoder_logits));
+        // Copy logits to persistent
+        ggml_build_forward_expand(gf, ggml_cpy(gctx, logits, ctx->decoder_logits));
+    }
 
     return gf;
 }
@@ -1638,11 +1641,14 @@ static ggml_cgraph * build_decoder_step_graph(
     voxtral_context     * ctx,
     ggml_context * gctx,
     int32_t               position,    // absolute position
-    int32_t               audio_pos)   // position in audio embeddings (may differ)
+    int32_t               audio_pos,   // position in audio embeddings (may differ)
+    bool                  store_logits,
+    ggml_tensor       **  token_id_out,
+    ggml_tensor       **  pos_tensor_out,
+    ggml_tensor       **  time_emb_out)
 {
     voxtral_model * model = ctx->model;
     ggml_cgraph * gf = ggml_new_graph_custom(gctx, GGML_DEFAULT_GRAPH_SIZE * 4, false);
-
     const int32_t kv_used = ctx->kv_used;  // tokens already in KV cache
 
     // Token ID input: [1] int32
@@ -1685,8 +1691,23 @@ static ggml_cgraph * build_decoder_step_graph(
     ggml_tensor * x_flat = ggml_reshape_1d(gctx, x, VOXTRAL_DEC_DIM); // [dec_dim]
     ggml_tensor * logits = ggml_mul_mat(gctx, model->tok_embeddings_weight, x_flat); // [vocab_size]
 
-    // Copy to persistent
-    ggml_build_forward_expand(gf, ggml_cpy(gctx, logits, ctx->decoder_logits));
+    if (store_logits) {
+        ggml_build_forward_expand(gf, ggml_cpy(gctx, logits, ctx->decoder_logits));
+    }
+
+    ggml_tensor * logits_2d = ggml_reshape_2d(gctx, logits, VOXTRAL_VOCAB_SIZE, 1);
+    ggml_tensor * next_token = ggml_argmax(gctx, logits_2d);
+    ggml_build_forward_expand(gf, ggml_cpy(gctx, next_token, ctx->decoder_next_token));
+
+    if (token_id_out) {
+        *token_id_out = token_id;
+    }
+    if (pos_tensor_out) {
+        *pos_tensor_out = pos_tensor;
+    }
+    if (time_emb_out) {
+        *time_emb_out = time_emb;
+    }
 
     return gf;
 }
@@ -1834,7 +1855,7 @@ static bool run_decoder_prefill(
     voxtral_context * ctx,
     const int32_t   * token_ids,
     int32_t           n_tokens,
-    float           * logits_out)  // [vocab_size]
+    float           * logits_out)  // [vocab_size] or nullptr
 {
     LOG_INFO(ctx, "decoder prefill: %d tokens", n_tokens);
 
@@ -1854,7 +1875,7 @@ static bool run_decoder_prefill(
     };
     ggml_context * gctx = ggml_init(p);
 
-    ggml_cgraph * gf = build_decoder_prefill_graph(ctx, gctx, n_tokens);
+    ggml_cgraph * gf = build_decoder_prefill_graph(ctx, gctx, n_tokens, logits_out != nullptr);
     log_graph_info(ctx, "decoder prefill", gf);
 
     ggml_backend_sched_reset(ctx->sched_dec_pre);
@@ -1897,8 +1918,9 @@ static bool run_decoder_prefill(
     // Compute
     ggml_backend_sched_graph_compute(ctx->sched_dec_pre, gf);
 
-    // Read logits
-    ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+    if (logits_out != nullptr) {
+        ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+    }
 
     ctx->kv_used = std::min(n_tokens, VOXTRAL_DEC_WINDOW);
 
@@ -1918,7 +1940,8 @@ static bool run_decoder_step(
     int32_t           token_id,
     int32_t           position,     // absolute position in decoder sequence
     int32_t           audio_pos,    // position in adapter output for audio embedding
-    float           * logits_out)   // [vocab_size]
+    float           * logits_out,   // [vocab_size] or nullptr
+    int32_t         * next_token_out)
 {
     if (ctx->kv_used >= VOXTRAL_DEC_WINDOW) {
         kv_cache_shift_left(ctx, 1);
@@ -1936,7 +1959,11 @@ static bool run_decoder_step(
     };
     ggml_context * gctx = ggml_init(p);
 
-    ggml_cgraph * gf = build_decoder_step_graph(ctx, gctx, position, audio_pos);
+    ggml_tensor * tok_t = nullptr;
+    ggml_tensor * pos_t = nullptr;
+    ggml_tensor * time_t = nullptr;
+    ggml_cgraph * gf = build_decoder_step_graph(
+        ctx, gctx, position, audio_pos, logits_out != nullptr, &tok_t, &pos_t, &time_t);
     log_graph_info(ctx, "decoder step", gf);
 
     ggml_backend_sched_reset(ctx->sched_dec_step);
@@ -1947,17 +1974,14 @@ static bool run_decoder_step(
     }
 
     // Set inputs
-    ggml_tensor * tok_t = find_tensor_in_graph(gf, "token_id");
     if (tok_t) {
         ggml_backend_tensor_set(tok_t, &token_id, 0, sizeof(int32_t));
     }
 
-    ggml_tensor * pos_t = find_tensor_in_graph(gf, "position");
     if (pos_t) {
         ggml_backend_tensor_set(pos_t, &position, 0, sizeof(int32_t));
     }
 
-    ggml_tensor * time_t = find_tensor_in_graph(gf, "time_emb");
     if (time_t) {
         ggml_backend_tensor_set(time_t, ctx->time_emb_cpu.data(), 0, VOXTRAL_DEC_DIM * sizeof(float));
     }
@@ -1965,8 +1989,78 @@ static bool run_decoder_step(
     // Compute
     ggml_backend_sched_graph_compute(ctx->sched_dec_step, gf);
 
-    // Read logits
-    ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+    if (logits_out != nullptr) {
+        ggml_backend_tensor_get(ctx->decoder_logits, logits_out, 0, VOXTRAL_VOCAB_SIZE * sizeof(float));
+    }
+
+    if (next_token_out != nullptr) {
+        ggml_backend_tensor_get(ctx->decoder_next_token, next_token_out, 0, sizeof(int32_t));
+    }
+
+    ctx->kv_used += 1;
+
+    ggml_backend_sched_reset(ctx->sched_dec_step);
+    ggml_free(gctx);
+
+    return true;
+}
+
+static bool run_decoder_step_token_only(
+    voxtral_context * ctx,
+    int32_t           token_id,
+    int32_t           position,
+    int32_t           audio_pos,
+    int32_t         * next_token_out)
+{
+    if (next_token_out == nullptr) {
+        return false;
+    }
+
+    if (ctx->kv_used >= VOXTRAL_DEC_WINDOW) {
+        kv_cache_shift_left(ctx, 1);
+        ctx->kv_used = VOXTRAL_DEC_WINDOW - 1;
+    }
+
+    const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
+                             ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
+    std::vector<uint8_t> meta_buf(meta_size);
+
+    ggml_init_params p = {
+        /*.mem_size  =*/ meta_size,
+        /*.mem_buffer=*/ meta_buf.data(),
+        /*.no_alloc  =*/ true,
+    };
+    ggml_context * gctx = ggml_init(p);
+
+    ggml_tensor * tok_t = nullptr;
+    ggml_tensor * pos_t = nullptr;
+    ggml_tensor * time_t = nullptr;
+    ggml_cgraph * gf = build_decoder_step_graph(
+        ctx, gctx, position, audio_pos, false, &tok_t, &pos_t, &time_t);
+    log_graph_info(ctx, "decoder step(token-only)", gf);
+
+    ggml_backend_sched_reset(ctx->sched_dec_step);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched_dec_step, gf)) {
+        LOG_ERR(ctx, "decoder step(token-only): failed to allocate graph");
+        ggml_free(gctx);
+        return false;
+    }
+
+    if (tok_t) {
+        ggml_backend_tensor_set(tok_t, &token_id, 0, sizeof(int32_t));
+    }
+
+    if (pos_t) {
+        ggml_backend_tensor_set(pos_t, &position, 0, sizeof(int32_t));
+    }
+
+    if (time_t) {
+        ggml_backend_tensor_set(time_t, ctx->time_emb_cpu.data(), 0, VOXTRAL_DEC_DIM * sizeof(float));
+    }
+
+    ggml_backend_sched_graph_compute(ctx->sched_dec_step, gf);
+
+    ggml_backend_tensor_get(ctx->decoder_next_token, next_token_out, 0, sizeof(int32_t));
 
     ctx->kv_used += 1;
 
@@ -1986,8 +2080,10 @@ static bool voxtral_transcribe_from_audio(
     int32_t           n_samples,
     int32_t           max_tokens,
     voxtral_result  & result,
+    bool              return_first_step_logits,
     bool              log_audio)
 {
+    const auto t_total_start = std::chrono::steady_clock::now();
     result.text.clear();
     result.tokens.clear();
     result.first_step_logits.clear();
@@ -2041,14 +2137,20 @@ static bool voxtral_transcribe_from_audio(
     }
 
     // 4. Run encoder
+    const auto t_encoder_start = std::chrono::steady_clock::now();
     if (!run_encoder(&ctx, mel_data.data(), n_frames)) {
         return false;
     }
+    const double encoder_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_encoder_start).count();
 
     // 5. Run adapter
+    const auto t_adapter_start = std::chrono::steady_clock::now();
     if (!run_adapter(&ctx)) {
         return false;
     }
+    const double adapter_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_adapter_start).count();
 
     const int32_t n_audio = ctx.dec_seq_len;
 
@@ -2071,54 +2173,55 @@ static bool voxtral_transcribe_from_audio(
     clear_kv_cache(&ctx);
 
     // 8. Decoder prefill
-    std::vector<float> logits(VOXTRAL_VOCAB_SIZE);
+    std::vector<float> logits;
+    if (return_first_step_logits) {
+        logits.resize(VOXTRAL_VOCAB_SIZE);
+    }
+    const auto t_prefill_start = std::chrono::steady_clock::now();
     if (L > 1) {
-        if (!run_decoder_prefill(&ctx, prompt_ids.data(), L - 1, logits.data())) {
+        if (!run_decoder_prefill(&ctx, prompt_ids.data(), L - 1,
+                return_first_step_logits ? logits.data() : nullptr)) {
             return false;
         }
     }
+    const double prefill_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_prefill_start).count();
 
     // 8b. One step with last prefix token (matches Python prefill + forward_one)
-    if (!run_decoder_step(&ctx, prompt_ids[L - 1], L - 1, L - 1, logits.data())) {
-        return false;
-    }
-
-    // First token from prefill
     int32_t token = 0;
-    float max_logit = -INFINITY;
-    for (int32_t i = 0; i < VOXTRAL_VOCAB_SIZE; i++) {
-        if (logits[i] > max_logit) {
-            max_logit = logits[i];
-            token = i;
+    const auto t_first_step_start = std::chrono::steady_clock::now();
+    if (return_first_step_logits) {
+        if (!run_decoder_step(&ctx, prompt_ids[L - 1], L - 1, L - 1, logits.data(), &token)) {
+            return false;
+        }
+        result.first_step_logits = logits;
+    } else {
+        if (!run_decoder_step_token_only(&ctx, prompt_ids[L - 1], L - 1, L - 1, &token)) {
+            return false;
         }
     }
+    const double first_step_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_first_step_start).count();
 
-    // Store first step logits
-    result.first_step_logits = logits;
     result.tokens.push_back(token);
 
     LOG_INFO(&ctx, "first token: %d", token);
 
     // 9. Autoregressive decoding
+    const auto t_decode_loop_start = std::chrono::steady_clock::now();
     for (int32_t pos = L; pos < n_audio && (int32_t)result.tokens.size() < max_tokens; pos++) {
         if (token == VOXTRAL_TOKEN_EOS) break;
 
-        if (!run_decoder_step(&ctx, token, pos, pos, logits.data())) {
+        int32_t next_token = 0;
+        if (!run_decoder_step_token_only(&ctx, token, pos, pos, &next_token)) {
             return false;
         }
 
-        // Greedy argmax
-        token = 0;
-        max_logit = -INFINITY;
-        for (int32_t i = 0; i < VOXTRAL_VOCAB_SIZE; i++) {
-            if (logits[i] > max_logit) {
-                max_logit = logits[i];
-                token = i;
-            }
-        }
-
+        token = next_token;
         result.tokens.push_back(token);
     }
+    const double decode_loop_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_decode_loop_start).count();
 
     // Remove trailing EOS
     if (!result.tokens.empty() && result.tokens.back() == VOXTRAL_TOKEN_EOS) {
@@ -2130,6 +2233,13 @@ static bool voxtral_transcribe_from_audio(
     // 10. Decode tokens to text (Tekken vocab from GGUF metadata)
     result.text = decode_tokens(*ctx.model, result.tokens);
 
+    const double total_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_total_start).count();
+    LOG_DBG(&ctx,
+        "stage_ms: encoder=%.2f adapter=%.2f prefill=%.2f first_step=%.2f decode_loop=%.2f total=%.2f tokens=%d audio_tokens=%d",
+        encoder_ms, adapter_ms, prefill_ms, first_step_ms, decode_loop_ms, total_ms,
+        (int) result.tokens.size(), n_audio);
+
     return true;
 }
 
@@ -2137,17 +2247,28 @@ bool voxtral_transcribe_audio(
     voxtral_context   & ctx,
     const std::vector<float> & audio,
     int32_t             max_tokens,
-    voxtral_result    & result)
+    voxtral_result    & result,
+    bool                return_first_step_logits)
 {
     return voxtral_transcribe_from_audio(
-        ctx, audio.data(), (int32_t) audio.size(), max_tokens, result, true);
+        ctx, audio.data(), (int32_t) audio.size(), max_tokens, result, return_first_step_logits, true);
+}
+
+bool voxtral_context_uses_cuda(const voxtral_context & ctx) {
+#ifdef GGML_USE_CUDA
+    return ctx.backend != nullptr && ggml_backend_is_cuda(ctx.backend);
+#else
+    (void) ctx;
+    return false;
+#endif
 }
 
 bool voxtral_transcribe_file(
     voxtral_context   & ctx,
     const std::string & audio_path,
     int32_t             max_tokens,
-    voxtral_result    & result)
+    voxtral_result    & result,
+    bool                return_first_step_logits)
 {
     std::vector<float> audio;
     if (!load_wav_file(audio_path, audio)) {
@@ -2158,5 +2279,5 @@ bool voxtral_transcribe_file(
         (float)audio.size() / VOXTRAL_SAMPLE_RATE);
 
     return voxtral_transcribe_from_audio(
-        ctx, audio.data(), (int32_t) audio.size(), max_tokens, result, false);
+        ctx, audio.data(), (int32_t) audio.size(), max_tokens, result, return_first_step_logits, false);
 }

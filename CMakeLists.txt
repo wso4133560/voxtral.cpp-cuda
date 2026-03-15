@@ -106,6 +106,9 @@ endif()
 add_executable(voxtral src/main.cpp)
 target_link_libraries(voxtral PRIVATE voxtral_lib)
 
+add_executable(voxtral-bench src/voxtral-bench.cpp)
+target_link_libraries(voxtral-bench PRIVATE voxtral_lib)
+
 add_executable(voxtral-quantize src/voxtral-quantize.cpp)
 target_link_libraries(voxtral-quantize PRIVATE ggml Threads::Threads m dl)
 

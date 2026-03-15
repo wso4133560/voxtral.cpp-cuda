@@ -143,13 +143,17 @@ bool voxtral_transcribe_file(
     voxtral_context  & ctx,
     const std::string & audio_path,
     int32_t            max_tokens,
-    voxtral_result   & result);
+    voxtral_result   & result,
+    bool               return_first_step_logits = false);
 
 bool voxtral_transcribe_audio(
     voxtral_context  & ctx,
     const std::vector<float> & audio,
     int32_t            max_tokens,
-    voxtral_result   & result);
+    voxtral_result   & result,
+    bool               return_first_step_logits = false);
+
+bool voxtral_context_uses_cuda(const voxtral_context & ctx);
 
 #endif // __cplusplus
 
