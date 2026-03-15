@@ -43,6 +43,25 @@ ffmpeg -i input.mp3 -ar 16000 -ac 1 -c:a pcm_s16le output.wav
 
 ## Advanced Usage
 
+### Optimized Real-time Transcription
+
+If PulseAudio is available during the build, CMake also generates an optimized real-time client:
+
+```bash
+./build/voxtral-realtime-opt \
+  --model models/voxtral/Q4_0.gguf \
+  --cuda \
+  --threads 8 \
+  --interval 1500 \
+  --show-stats
+```
+
+To inspect available PulseAudio capture sources before starting:
+
+```bash
+./build/voxtral-realtime-opt --list-sources
+```
+
 ### Manual Quantization
 
 You can quantize an existing GGUF file using the native quantizer:
