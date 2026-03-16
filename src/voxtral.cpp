@@ -1746,7 +1746,14 @@ static ggml_tensor * build_decoder_layer(
 
     // Flatten Q back: [head_dim, n_heads, n_tokens] -> [n_heads*head_dim, n_tokens]
     q = ggml_cont(gctx, ggml_reshape_2d(gctx, q, VOXTRAL_DEC_HEADS * VOXTRAL_DEC_HEAD_DIM, n_tokens));
-    k = ggml_cont(gctx, ggml_reshape_2d(gctx, k, kv_dim, n_tokens));
+
+    // Flatten K back and ensure it's contiguous before caching
+    // This is critical for FP32->FP16 conversion in ggml_cpy
+    k = ggml_reshape_2d(gctx, k, kv_dim, n_tokens);
+    k = ggml_cont(gctx, k);
+
+    // Ensure V is also contiguous for reliable FP32->FP16 conversion
+    v = ggml_cont(gctx, v);
 
     // Store K, V in KV cache at positions [kv_offset .. kv_offset+n_tokens-1]
     // KV cache layout: [kv_dim, dec_window, dec_layers]
