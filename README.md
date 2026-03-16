@@ -62,6 +62,39 @@ To inspect available PulseAudio capture sources before starting:
 ./build/voxtral-realtime-opt --list-sources
 ```
 
+### Real-time Chinese Translation
+
+If PulseAudio is available during the build, CMake also generates a translation wrapper that pipes
+the live English transcript from `voxtral-realtime-opt` through a local Ollama translation model.
+
+Prepare the Ollama model first:
+
+```bash
+ollama pull translategemma:4b-it-q4_K_M
+```
+
+The default translation model used by `voxtral-realtime-translate` is:
+- `translategemma:4b-it-q4_K_M`
+
+Run the real-time Chinese translation client:
+
+```bash
+./build/voxtral-realtime-translate \
+  --model models/voxtral/Q4_0.gguf \
+  --cuda \
+  --show-original
+```
+
+If needed, you can override the Ollama endpoint or model name:
+
+```bash
+./build/voxtral-realtime-translate \
+  --model models/voxtral/Q4_0.gguf \
+  --cuda \
+  --ollama-host 127.0.0.1:11434 \
+  --ollama-model translategemma:4b-it-q4_K_M
+```
+
 ### Manual Quantization
 
 You can quantize an existing GGUF file using the native quantizer:

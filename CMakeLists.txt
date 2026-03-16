@@ -121,6 +121,8 @@ if(PKG_CONFIG_FOUND)
         target_link_libraries(voxtral-realtime-opt PRIVATE voxtral_lib ${PULSEAUDIO_LIBRARIES})
         target_include_directories(voxtral-realtime-opt PRIVATE ${PULSEAUDIO_INCLUDE_DIRS})
 
+        add_executable(voxtral-realtime-translate src/voxtral-realtime-translate.cpp)
+
         message(STATUS "Building voxtral-realtime-opt with PulseAudio support")
     else()
         message(STATUS "PulseAudio not found, skipping voxtral-realtime-opt")
