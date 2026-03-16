@@ -369,7 +369,9 @@ transcript_line parse_line(const std::string & raw_line) {
     }
 
     line.prefix = line.raw.substr(0, bracket + 1);
-    line.text = line.raw.substr(bracket + 2);
+    if (bracket + 2 < line.raw.size()) {
+        line.text = line.raw.substr(bracket + 2);
+    }
     return line;
 }
 
@@ -382,7 +384,12 @@ void print_translated_line(const transcript_line & line, const std::string & chi
 
     std::cout << "🌏 ";
     if (!line.prefix.empty()) {
-        std::cout << line.prefix.substr(std::string("\xF0\x9F\x8E\xA4 ").size()) << ' ';
+        const std::string emoji_prefix = "\xF0\x9F\x8E\xA4 ";
+        if (line.prefix.size() > emoji_prefix.size()) {
+            std::cout << line.prefix.substr(emoji_prefix.size()) << ' ';
+        } else {
+            std::cout << line.prefix << ' ';
+        }
     }
     std::cout << chinese;
     if (show_original) {
