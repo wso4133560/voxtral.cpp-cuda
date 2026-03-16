@@ -6,7 +6,7 @@ Voxtral Real-time Transcription
 Quick Start Guide
 ========================================
 
-🎉 实时音频转录客户端已成功构建！
+🎉 优化版实时音频转录客户端已成功构建！
 
 📋 功能特性
 -----------
@@ -20,10 +20,10 @@ Quick Start Guide
 -----------
 
 1. 列出可用的音频源：
-   ./build/voxtral-realtime --list-sources
+   ./build/voxtral-realtime-opt --list-sources
 
 2. 开始实时转录（使用默认音频监视器）：
-   ./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda
+   ./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda
 
 3. 播放任何音频/视频，观察实时转录！
 
@@ -31,18 +31,18 @@ Quick Start Guide
 -----------
 
 # 基本使用（CUDA加速）
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda
 
 # 更快的响应（1秒间隔）
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda --interval 1000
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda --interval 1000
 
 # 指定特定音频源
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf \
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf \
     --source alsa_output.pci-0000_00_1f.3.analog-stereo.monitor \
     --cuda
 
 # 保存转录到文件
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda 2>/dev/null > transcript.txt
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda 2>/dev/null > transcript.txt
 
 🎬 运行演示
 -----------

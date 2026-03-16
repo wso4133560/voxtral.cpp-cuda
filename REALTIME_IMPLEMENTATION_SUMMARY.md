@@ -2,7 +2,7 @@
 
 ## 🎉 实现完成
 
-成功实现了一个能够抓取系统音频并实时显示转录信息的客户端 `voxtral-realtime`。
+当前保留的是能够抓取系统音频并实时显示转录信息的优化版客户端 `voxtral-realtime-opt`。
 
 ## ✅ 核心功能
 
@@ -30,7 +30,7 @@
 ## 📁 新增文件
 
 ### 1. 源代码
-- **src/voxtral-realtime.cpp** - 实时转录客户端主程序
+- **src/voxtral-realtime-optimized.cpp** - 优化版实时转录客户端主程序
 
 ### 2. 文档
 - **REALTIME_TRANSCRIPTION.md** - 详细使用指南
@@ -43,16 +43,16 @@
 ## 🔧 修改的文件
 
 ### CMakeLists.txt
-添加了voxtral-realtime目标：
+当前保留 voxtral-realtime-opt 目标：
 ```cmake
 # Real-time transcription client (requires PulseAudio)
 find_package(PkgConfig)
 if(PKG_CONFIG_FOUND)
     pkg_check_modules(PULSEAUDIO libpulse-simple)
     if(PULSEAUDIO_FOUND)
-        add_executable(voxtral-realtime src/voxtral-realtime.cpp)
-        target_link_libraries(voxtral-realtime PRIVATE voxtral_lib ${PULSEAUDIO_LIBRARIES})
-        target_include_directories(voxtral-realtime PRIVATE ${PULSEAUDIO_INCLUDE_DIRS})
+        add_executable(voxtral-realtime-opt src/voxtral-realtime-optimized.cpp)
+        target_link_libraries(voxtral-realtime-opt PRIVATE voxtral_lib ${PULSEAUDIO_LIBRARIES})
+        target_include_directories(voxtral-realtime-opt PRIVATE ${PULSEAUDIO_INCLUDE_DIRS})
     endif()
 endif()
 ```
@@ -180,21 +180,21 @@ cmake --build build -j
 ### 基本使用
 ```bash
 # 使用默认系统音频监视器
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda
 
 # 指定音频源
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf \
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf \
     --source alsa_output.pci-0000_00_1f.3.analog-stereo.monitor \
     --cuda
 
 # 调整转录间隔（更快响应）
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf \
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf \
     --cuda --interval 1000
 ```
 
 ### 列出音频源
 ```bash
-./build/voxtral-realtime --list-sources
+./build/voxtral-realtime-opt --list-sources
 # 或
 pactl list sources short
 ```
@@ -214,26 +214,26 @@ pactl list sources short
 ### 1. 视频字幕
 播放YouTube视频或本地电影时，实时显示字幕：
 ```bash
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda
 ```
 
 ### 2. 在线会议转录
 记录Zoom/Teams会议内容：
 ```bash
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf \
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf \
     --cuda --interval 1500 > meeting_transcript.txt
 ```
 
 ### 3. 无障碍辅助
 为听力障碍用户提供实时字幕：
 ```bash
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda
 ```
 
 ### 4. 内容��核
 监控音频内容：
 ```bash
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf \
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf \
     --cuda 2>/dev/null | grep -i "keyword"
 ```
 

@@ -5,7 +5,7 @@
 
 MODEL="models/voxtral/Q4_0.gguf"
 SAMPLE="samples/8297-275156-0002.wav"
-VOXTRAL_RT="build/voxtral-realtime"
+VOXTRAL_RT="build/voxtral-realtime-opt"
 
 echo "=========================================="
 echo "Real-time Transcription Test"
@@ -24,7 +24,7 @@ if [ ! -f "$SAMPLE" ]; then
 fi
 
 if [ ! -f "$VOXTRAL_RT" ]; then
-    echo "Error: voxtral-realtime not found"
+    echo "Error: voxtral-realtime-opt not found"
     exit 1
 fi
 
@@ -75,6 +75,6 @@ wait $RT_PID 2>/dev/null
 echo ""
 echo "Test completed!"
 echo ""
-echo "If you saw the transcription above, the real-time client is working!"
+echo "If you saw the transcription above, the optimized real-time client is working!"
 echo "You can now use it with any system audio by running:"
 echo "  $VOXTRAL_RT --model $MODEL --cuda"

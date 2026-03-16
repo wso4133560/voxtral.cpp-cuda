@@ -242,7 +242,7 @@ Sample 3: [完全匹配]
 
 - 3 次独立运行，标准差 < 0.5 tok/s
 - 无崩溃、无内存泄漏
-- 所有编译目标 (voxtral, voxtral-bench, voxtral-realtime) 正常工作
+- 所有编译目标 (voxtral, voxtral-bench, voxtral-realtime-opt) 正常工作
 
 ### 回归测试
 

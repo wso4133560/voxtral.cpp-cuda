@@ -1,8 +1,8 @@
-# Real-time Audio Transcription Client
+# Optimized Real-time Audio Transcription Client
 
 ## Overview
 
-`voxtral-realtime` is a real-time audio transcription client that captures system audio and displays live transcriptions in the terminal. It's perfect for:
+`voxtral-realtime-opt` is the real-time audio transcription client that captures system audio and displays live transcriptions in the terminal. It's perfect for:
 
 - Live captioning of videos/movies
 - Transcribing online meetings
@@ -34,7 +34,7 @@ cmake --build build -j
 
 If PulseAudio is not found, you'll see:
 ```
-PulseAudio not found, skipping voxtral-realtime
+PulseAudio not found, skipping voxtral-realtime-opt
 ```
 
 Install PulseAudio development files:
@@ -56,13 +56,13 @@ sudo pacman -S libpulse
 Capture default system audio monitor:
 
 ```bash
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda
 ```
 
 ### List Available Audio Sources
 
 ```bash
-./build/voxtral-realtime --list-sources
+./build/voxtral-realtime-opt --list-sources
 ```
 
 Or use pactl directly:
@@ -73,7 +73,7 @@ pactl list sources short
 ### Specify Audio Source
 
 ```bash
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf \
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf \
     --source alsa_output.pci-0000_00_1f.3.analog-stereo.monitor \
     --cuda
 ```
@@ -145,10 +145,10 @@ Adjust the interval between transcriptions:
 
 ```bash
 # Faster updates (1 second)
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda --interval 1000
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda --interval 1000
 
 # Slower updates (5 seconds)
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda --interval 5000
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda --interval 5000
 ```
 
 **Trade-offs:**
@@ -169,7 +169,7 @@ static constexpr int BUFFER_DURATION_MS = 3000;  // 3 seconds
 
 1. Start the transcription client:
 ```bash
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda
 ```
 
 2. Play a YouTube video in your browser
@@ -179,7 +179,7 @@ static constexpr int BUFFER_DURATION_MS = 3000;  // 3 seconds
 
 ```bash
 # Use faster updates for meetings
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda --interval 1500
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda --interval 1500
 ```
 
 ### Example 3: Transcribe Movie with Specific Audio Device
@@ -189,7 +189,7 @@ static constexpr int BUFFER_DURATION_MS = 3000;  // 3 seconds
 pactl list sources short
 
 # Use specific HDMI output
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf \
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf \
     --source alsa_output.pci-0000_03_00.1.hdmi-stereo.monitor \
     --cuda
 ```
@@ -250,7 +250,7 @@ pactl list sources | grep -E "(Name|Description)" | grep monitor
 
 Use the monitor source explicitly:
 ```bash
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf \
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf \
     --source YOUR_MONITOR_SOURCE.monitor --cuda
 ```
 
@@ -278,7 +278,7 @@ Tested on NVIDIA RTX 3080 with Q4_0 model:
 ### Redirect Output to File
 
 ```bash
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda 2>/dev/null > transcript.txt
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda 2>/dev/null > transcript.txt
 ```
 
 ### Use with Screen Reader
@@ -286,7 +286,7 @@ Tested on NVIDIA RTX 3080 with Q4_0 model:
 The output is designed to work with screen readers for accessibility:
 
 ```bash
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda | espeak
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda | espeak
 ```
 
 ### Integration with OBS
@@ -294,7 +294,7 @@ The output is designed to work with screen readers for accessibility:
 Use as a live caption source for streaming:
 
 ```bash
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda > /tmp/captions.txt
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda > /tmp/captions.txt
 ```
 
 Then configure OBS to read from `/tmp/captions.txt`.

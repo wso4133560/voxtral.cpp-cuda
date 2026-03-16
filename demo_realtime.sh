@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Real-time Audio Transcription Demo
-# This script demonstrates the voxtral-realtime client
+# This script demonstrates the optimized real-time client
 
 MODEL="models/voxtral/Q4_0.gguf"
-VOXTRAL_RT="build/voxtral-realtime"
+VOXTRAL_RT="build/voxtral-realtime-opt"
 
 echo "=========================================="
 echo "Real-time Audio Transcription Demo"
@@ -18,9 +18,9 @@ if [ ! -f "$MODEL" ]; then
     exit 1
 fi
 
-# Check if voxtral-realtime exists
+# Check if voxtral-realtime-opt exists
 if [ ! -f "$VOXTRAL_RT" ]; then
-    echo "Error: voxtral-realtime not found at $VOXTRAL_RT"
+    echo "Error: voxtral-realtime-opt not found at $VOXTRAL_RT"
     echo "Please build the project first."
     exit 1
 fi

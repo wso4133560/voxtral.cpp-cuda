@@ -4,7 +4,7 @@
 
 成功为 voxtral.cpp 项目实现了两大核心功能：
 1. **CUDA后端支持** - GPU加速推理
-2. **实时音频转录客户端** - 系统音频捕获和实时转录
+2. **优化版实时音频转录客户端** - 系统音频捕获和实时转录
 
 ---
 
@@ -63,20 +63,20 @@ ggml_backend_tensor_set(ctx->kv_self_k, zeros.data(), 0, size);
 
 ---
 
-## 第二部分：实时音频转录客户端
+## 第二部分：优化版实时音频转录客户端
 
 ### 实现内容
 
 #### 新增文件
 
-1. **src/voxtral-realtime.cpp** (350行)
+1. **src/voxtral-realtime-optimized.cpp**
    - 多线程架构（音频捕获 + 转录）
    - PulseAudio集成
    - 智能缓冲管理
-   - 能量检测
+   - 高级VAD和音频预处理
 
 2. **CMakeLists.txt** (更新)
-   - 添加 `voxtral-realtime` 目标
+   - 保留 `voxtral-realtime-opt` 目标
    - PulseAudio依赖检测
 
 #### 核心功能
@@ -173,7 +173,7 @@ ggml_backend_tensor_set(ctx->kv_self_k, zeros.data(), 0, size);
 - ✅ test_cuda.sh (新增)
 
 #### 实时转录
-- ✅ src/voxtral-realtime.cpp (新增)
+- ✅ src/voxtral-realtime-optimized.cpp
 - ✅ CMakeLists.txt (修改)
 - ✅ REALTIME_TRANSCRIPTION.md (新增)
 - ✅ REALTIME_IMPLEMENTATION_SUMMARY.md (新增)
@@ -183,7 +183,7 @@ ggml_backend_tensor_set(ctx->kv_self_k, zeros.data(), 0, size);
 
 ### 测试状态
 - ✅ CUDA后端：所有测试通过
-- ✅ 实时转录：编译成功，功能完整
+- ✅ 实时转录：`voxtral-realtime-opt` 编译成功，功能完整
 - ✅ 文档：完整且详细
 
 ---
@@ -210,18 +210,18 @@ cmake --build build -j
 
 ```bash
 # 基本使用
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf --cuda
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf --cuda
 
 # 列出音频源
-./build/voxtral-realtime --list-sources
+./build/voxtral-realtime-opt --list-sources
 
 # 指定音频源
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf \
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf \
     --source alsa_output.pci-0000_00_1f.3.analog-stereo.monitor \
     --cuda
 
 # 调整间隔
-./build/voxtral-realtime --model models/voxtral/Q4_0.gguf \
+./build/voxtral-realtime-opt --model models/voxtral/Q4_0.gguf \
     --cuda --interval 1000
 
 # 运行演示
