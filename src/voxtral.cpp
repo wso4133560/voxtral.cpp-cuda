@@ -140,6 +140,12 @@ struct decoder_step_bucket_cache {
     std::vector<float> mask_cpu;
 };
 
+struct prefill_cache_entry {
+    ggml_context * gctx = nullptr;
+    ggml_cgraph  * gf   = nullptr;
+    std::vector<uint8_t> meta_buf;
+};
+
 // ============================================================================
 // Context structure
 // ============================================================================
@@ -196,7 +202,20 @@ struct voxtral_context {
     std::vector<decoder_step_bucket_cache> dec_step_buckets;
     int32_t dec_step_active_bucket = -1;
 
+    // Pre-computed encoder attention masks for common sequence lengths
+    std::unordered_map<int32_t, std::vector<float>> enc_mask_cache;
+
+    // Decoder prefill graph cache for common token counts
+    std::unordered_map<int32_t, prefill_cache_entry> dec_prefill_cache;
+
 };
+
+// Forward declarations
+static ggml_cgraph * build_decoder_prefill_graph(
+    voxtral_context * ctx,
+    ggml_context * gctx,
+    int32_t n_tokens,
+    bool store_logits);
 
 static inline bool should_log(const voxtral_context * ctx, voxtral_log_level lvl) {
     return ctx != nullptr && ctx->logger &&
@@ -1214,6 +1233,46 @@ voxtral_context * voxtral_init_from_model(
         LOG_INFO(ctx, "ada_scale pre-computed for %d decoder layers", VOXTRAL_DEC_LAYERS);
     }
 
+    // Pre-compute encoder attention masks for common sequence lengths
+    {
+        const int32_t common_lens[] = {64, 128, 256, 512, 750};
+        for (int32_t seq_len : common_lens) {
+            std::vector<float> mask((size_t)seq_len * seq_len);
+            for (int32_t q = 0; q < seq_len; ++q) {
+                const int32_t min_kv = std::max<int32_t>(0, q - (VOXTRAL_ENC_WINDOW - 1));
+                for (int32_t kv = 0; kv < seq_len; ++kv) {
+                    const bool allow = (kv <= q) && (kv >= min_kv);
+                    mask[(size_t)q * seq_len + kv] = allow ? 0.0f : -INFINITY;
+                }
+            }
+            ctx->enc_mask_cache[seq_len] = std::move(mask);
+        }
+        LOG_INFO(ctx, "encoder attention masks pre-computed for %zu common lengths", ctx->enc_mask_cache.size());
+    }
+
+    // Pre-build decoder prefill graphs for common token counts
+    {
+        const int32_t common_counts[] = {1, 2, 4, 8, 16, 32, 64};
+        for (int32_t n_tokens : common_counts) {
+            const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
+                                     ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
+
+            prefill_cache_entry entry;
+            entry.meta_buf.resize(meta_size);
+
+            ggml_init_params p = {
+                /*.mem_size  =*/ meta_size,
+                /*.mem_buffer=*/ entry.meta_buf.data(),
+                /*.no_alloc  =*/ true,
+            };
+            entry.gctx = ggml_init(p);
+            entry.gf = build_decoder_prefill_graph(ctx, entry.gctx, n_tokens, false);
+
+            ctx->dec_prefill_cache[n_tokens] = std::move(entry);
+        }
+        LOG_INFO(ctx, "decoder prefill graphs pre-built for %zu common token counts", ctx->dec_prefill_cache.size());
+    }
+
     LOG_INFO(ctx, "context initialized");
     return ctx;
 }
@@ -1223,6 +1282,11 @@ void voxtral_free(voxtral_context * ctx) {
     for (auto & bucket : ctx->dec_step_buckets) {
         if (bucket.gctx) {
             ggml_free(bucket.gctx);
+        }
+    }
+    for (auto & [n_tokens, entry] : ctx->dec_prefill_cache) {
+        if (entry.gctx) {
+            ggml_free(entry.gctx);
         }
     }
     if (ctx->sched_encoder)  ggml_backend_sched_free(ctx->sched_encoder);
@@ -2186,15 +2250,24 @@ static bool run_encoder(voxtral_context * ctx, const float * mel_data, int32_t n
     ggml_tensor * mask_t = find_tensor_in_graph(gf, "enc_attn_mask");
     if (mask_t) {
         const int32_t seq_len = ctx->enc_seq_used;
-        std::vector<float> mask((size_t) seq_len * seq_len);
-        for (int32_t q = 0; q < seq_len; ++q) {
-            const int32_t min_kv = std::max<int32_t>(0, q - (VOXTRAL_ENC_WINDOW - 1));
-            for (int32_t kv = 0; kv < seq_len; ++kv) {
-                const bool allow = (kv <= q) && (kv >= min_kv);
-                mask[(size_t) q * seq_len + kv] = allow ? 0.0f : -INFINITY;
+
+        // Try to use cached mask
+        auto it = ctx->enc_mask_cache.find(seq_len);
+        if (it != ctx->enc_mask_cache.end()) {
+            // Use pre-computed mask
+            ggml_backend_tensor_set(mask_t, it->second.data(), 0, it->second.size() * sizeof(float));
+        } else {
+            // Fallback: compute on-the-fly for uncommon lengths
+            std::vector<float> mask((size_t) seq_len * seq_len);
+            for (int32_t q = 0; q < seq_len; ++q) {
+                const int32_t min_kv = std::max<int32_t>(0, q - (VOXTRAL_ENC_WINDOW - 1));
+                for (int32_t kv = 0; kv < seq_len; ++kv) {
+                    const bool allow = (kv <= q) && (kv >= min_kv);
+                    mask[(size_t) q * seq_len + kv] = allow ? 0.0f : -INFINITY;
+                }
             }
+            ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(float));
         }
-        ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(float));
     }
 
     // Compute
@@ -2259,24 +2332,37 @@ static bool run_decoder_prefill(
         return false;
     }
 
-    const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
-                             ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
-    std::vector<uint8_t> meta_buf(meta_size);
+    ggml_context * gctx = nullptr;
+    ggml_cgraph * gf = nullptr;
+    std::vector<uint8_t> meta_buf;
 
-    ggml_init_params p = {
-        /*.mem_size  =*/ meta_size,
-        /*.mem_buffer=*/ meta_buf.data(),
-        /*.no_alloc  =*/ true,
-    };
-    ggml_context * gctx = ggml_init(p);
+    // Try to use cached prefill graph
+    auto it = ctx->dec_prefill_cache.find(n_tokens);
+    if (it != ctx->dec_prefill_cache.end() && logits_out == nullptr) {
+        // Use pre-built graph (only for non-logits case)
+        gctx = it->second.gctx;
+        gf = it->second.gf;
+    } else {
+        // Fallback: build graph on-the-fly
+        const size_t meta_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE * 4 +
+                                 ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE * 4, false);
+        meta_buf.resize(meta_size);
 
-    ggml_cgraph * gf = build_decoder_prefill_graph(ctx, gctx, n_tokens, logits_out != nullptr);
+        ggml_init_params p = {
+            /*.mem_size  =*/ meta_size,
+            /*.mem_buffer=*/ meta_buf.data(),
+            /*.no_alloc  =*/ true,
+        };
+        gctx = ggml_init(p);
+        gf = build_decoder_prefill_graph(ctx, gctx, n_tokens, logits_out != nullptr);
+    }
+
     log_graph_info(ctx, "decoder prefill", gf);
 
     ggml_backend_sched_reset(ctx->sched_dec_pre);
     if (!ggml_backend_sched_alloc_graph(ctx->sched_dec_pre, gf)) {
         LOG_ERR(ctx, "decoder prefill: failed to allocate graph");
-        ggml_free(gctx);
+        if (!meta_buf.empty()) ggml_free(gctx);  // Only free if we allocated it
         return false;
     }
 
@@ -2313,7 +2399,7 @@ static bool run_decoder_prefill(
     }
 
     ctx->kv_used = std::min(n_tokens, VOXTRAL_DEC_WINDOW);
-    ggml_free(gctx);
+    if (!meta_buf.empty()) ggml_free(gctx);  // Only free if we allocated it
 
     LOG_INFO(ctx, "decoder prefill done");
     return true;
