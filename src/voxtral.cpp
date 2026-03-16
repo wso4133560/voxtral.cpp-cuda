@@ -183,6 +183,11 @@ struct voxtral_context {
     ggml_backend_sched_t sched_dec_pre  = nullptr;
     ggml_backend_sched_t sched_dec_step = nullptr;
 
+    // Pre-computed ada_scale per decoder layer (constant since time_emb is fixed)
+    ggml_context  * ctx_ada_scales = nullptr;
+    ggml_backend_buffer_t buf_ada_scales = nullptr;
+    std::vector<ggml_tensor *> ada_scales; // [dec_layers], each [dec_dim]
+
     // CPU scratch
     std::vector<float> hann_window;     // [window_size]
     std::vector<float> mel_filters_cpu; // [n_freq * n_mel]
@@ -482,31 +487,93 @@ static bool load_wav_file(const std::string & path, std::vector<float> & audio_o
 // Mel spectrogram computation (CPU, matches Python compute_mel_spectrogram)
 // ============================================================================
 
+// Radix-2 FFT plan: zero-pad n_fft(400) to next power-of-2 (512)
 struct stft_plan {
-    int32_t n_fft = 0;
-    int32_t n_bins = 0;
-    std::vector<float> cos_table;
-    std::vector<float> sin_table;
+    int32_t n_fft = 0;       // original window size (400)
+    int32_t n_fft_padded = 0; // next power of 2 (512)
+    int32_t n_bins = 0;       // n_fft/2 + 1 (201)
+    std::vector<uint32_t> bit_rev; // bit-reversal permutation [n_fft_padded]
+    std::vector<float> twiddle_re; // twiddle factors real [n_fft_padded/2]
+    std::vector<float> twiddle_im; // twiddle factors imag [n_fft_padded/2]
 };
+
+static int32_t next_power_of_2(int32_t n) {
+    int32_t p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
 
 static const stft_plan & get_stft_plan() {
     static stft_plan plan = []() {
         stft_plan p;
-        p.n_fft  = VOXTRAL_N_FFT;
-        p.n_bins = VOXTRAL_N_FREQ;
-        p.cos_table.resize((size_t) p.n_bins * (size_t) p.n_fft);
-        p.sin_table.resize((size_t) p.n_bins * (size_t) p.n_fft);
-        for (int32_t k = 0; k < p.n_bins; ++k) {
-            for (int32_t n = 0; n < p.n_fft; ++n) {
-                const float angle = 2.0f * VOXTRAL_PI * (float) k * (float) n / (float) p.n_fft;
-                const size_t idx = (size_t) k * (size_t) p.n_fft + (size_t) n;
-                p.cos_table[idx] = cosf(angle);
-                p.sin_table[idx] = sinf(angle);
+        p.n_fft = VOXTRAL_N_FFT;
+        p.n_fft_padded = next_power_of_2(p.n_fft);
+        p.n_bins = VOXTRAL_N_FREQ; // 201
+
+        const int32_t N = p.n_fft_padded;
+        const int32_t log2N = (int32_t)__builtin_ctz((uint32_t)N);
+
+        // Bit-reversal permutation
+        p.bit_rev.resize(N);
+        for (int32_t i = 0; i < N; ++i) {
+            uint32_t rev = 0;
+            uint32_t val = (uint32_t)i;
+            for (int32_t b = 0; b < log2N; ++b) {
+                rev = (rev << 1) | (val & 1);
+                val >>= 1;
             }
+            p.bit_rev[i] = rev;
+        }
+
+        // Pre-compute twiddle factors for each FFT stage
+        p.twiddle_re.resize(N / 2);
+        p.twiddle_im.resize(N / 2);
+        for (int32_t i = 0; i < N / 2; ++i) {
+            const float angle = -2.0f * VOXTRAL_PI * (float)i / (float)N;
+            p.twiddle_re[i] = cosf(angle);
+            p.twiddle_im[i] = sinf(angle);
         }
         return p;
     }();
     return plan;
+}
+
+// In-place Cooley-Tukey radix-2 FFT
+static void fft_radix2(float * re, float * im, const stft_plan & plan) {
+    const int32_t N = plan.n_fft_padded;
+    const int32_t log2N = (int32_t)__builtin_ctz((uint32_t)N);
+
+    // Bit-reversal reorder
+    for (int32_t i = 0; i < N; ++i) {
+        const int32_t j = (int32_t)plan.bit_rev[i];
+        if (i < j) {
+            std::swap(re[i], re[j]);
+            std::swap(im[i], im[j]);
+        }
+    }
+
+    // Butterfly stages
+    for (int32_t s = 1; s <= log2N; ++s) {
+        const int32_t m = 1 << s;
+        const int32_t half = m >> 1;
+        const int32_t step = N / m; // twiddle index step
+
+        for (int32_t k = 0; k < N; k += m) {
+            for (int32_t j = 0; j < half; ++j) {
+                const int32_t tw_idx = j * step;
+                const float wr = plan.twiddle_re[tw_idx];
+                const float wi = plan.twiddle_im[tw_idx];
+
+                const float tr = wr * re[k + j + half] - wi * im[k + j + half];
+                const float ti = wr * im[k + j + half] + wi * re[k + j + half];
+
+                re[k + j + half] = re[k + j] - tr;
+                im[k + j + half] = im[k + j] - ti;
+                re[k + j] += tr;
+                im[k + j] += ti;
+            }
+        }
+    }
 }
 
 static void compute_mel_spectrogram(
@@ -547,8 +614,10 @@ static void compute_mel_spectrogram(
         }
     }
 
-    // Pre-allocate per-call buffers
-    std::vector<float> windowed((size_t) n_fft);
+    // Pre-allocate per-call buffers (FFT uses zero-padded size)
+    const int32_t n_padded = plan.n_fft_padded;
+    std::vector<float> fft_re((size_t) n_padded);
+    std::vector<float> fft_im((size_t) n_padded);
     std::vector<float> power((size_t) n_freq);
     std::vector<float> mel_accum((size_t) n_mel);
 
@@ -556,34 +625,20 @@ static void compute_mel_spectrogram(
         const int32_t start = frame * hop;
         const float * frame_ptr = centered.data() + (size_t) start;
 
+        // Window + zero-pad to next power-of-2
         for (int32_t i = 0; i < n_fft; ++i) {
-            windowed[(size_t) i] = frame_ptr[(size_t) i] * hann_window[(size_t) i];
+            fft_re[(size_t) i] = frame_ptr[(size_t) i] * hann_window[(size_t) i];
         }
+        memset(fft_re.data() + n_fft, 0, (size_t)(n_padded - n_fft) * sizeof(float));
+        memset(fft_im.data(), 0, (size_t)n_padded * sizeof(float));
 
-        // DFT with precomputed sin/cos tables
+        // Radix-2 FFT
+        fft_radix2(fft_re.data(), fft_im.data(), plan);
+
+        // Power spectrum (first n_freq bins)
         for (int32_t k = 0; k < n_freq; ++k) {
-            const float * cos_row = plan.cos_table.data() + (size_t) k * (size_t) n_fft;
-            const float * sin_row = plan.sin_table.data() + (size_t) k * (size_t) n_fft;
-            float re = 0.0f;
-            float im = 0.0f;
-
-            int32_t i = 0;
-            for (; i + 3 < n_fft; i += 4) {
-                const float x0 = windowed[(size_t) i + 0];
-                const float x1 = windowed[(size_t) i + 1];
-                const float x2 = windowed[(size_t) i + 2];
-                const float x3 = windowed[(size_t) i + 3];
-
-                re += x0 * cos_row[i + 0] + x1 * cos_row[i + 1] + x2 * cos_row[i + 2] + x3 * cos_row[i + 3];
-                im -= x0 * sin_row[i + 0] + x1 * sin_row[i + 1] + x2 * sin_row[i + 2] + x3 * sin_row[i + 3];
-            }
-            for (; i < n_fft; ++i) {
-                const float x = windowed[(size_t) i];
-                re += x * cos_row[i];
-                im -= x * sin_row[i];
-            }
-
-            power[(size_t) k] = re * re + im * im;
+            power[(size_t) k] = fft_re[(size_t) k] * fft_re[(size_t) k] +
+                                fft_im[(size_t) k] * fft_im[(size_t) k];
         }
 
         // Apply mel filterbank (k-major for cache-friendly access)
@@ -953,13 +1008,13 @@ voxtral_context * voxtral_init_from_model(
         ctx->decoder_time_emb = ggml_new_tensor_1d(ctx->ctx_persistent, GGML_TYPE_F32, VOXTRAL_DEC_DIM);
         ggml_set_name(ctx->decoder_time_emb, "decoder_time_emb");
 
-        // KV cache: [kv_dim, dec_window, dec_layers]
+        // KV cache: [kv_dim, dec_window, dec_layers] in FP16 to halve memory bandwidth
         const int32_t kv_dim = VOXTRAL_DEC_KV_HEADS * VOXTRAL_DEC_HEAD_DIM;  // 1024
-        ctx->kv_self_k = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F32,
+        ctx->kv_self_k = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F16,
             kv_dim, VOXTRAL_DEC_WINDOW, VOXTRAL_DEC_LAYERS);
         ggml_set_name(ctx->kv_self_k, "kv_self_k");
 
-        ctx->kv_self_v = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F32,
+        ctx->kv_self_v = ggml_new_tensor_3d(ctx->ctx_persistent, GGML_TYPE_F16,
             kv_dim, VOXTRAL_DEC_WINDOW, VOXTRAL_DEC_LAYERS);
         ggml_set_name(ctx->kv_self_v, "kv_self_v");
 
@@ -1016,6 +1071,149 @@ voxtral_context * voxtral_init_from_model(
     compute_time_embedding(ctx->time_emb_cpu, (float)VOXTRAL_N_DELAY_TOKENS, VOXTRAL_DEC_DIM);
     ggml_backend_tensor_set(ctx->decoder_time_emb, ctx->time_emb_cpu.data(), 0, VOXTRAL_DEC_DIM * sizeof(float));
 
+    // Pre-compute ada_scale per decoder layer: ada_mlp(time_emb) is constant
+    {
+        ggml_init_params ada_p = {
+            /*.mem_size  =*/ ggml_tensor_overhead() * VOXTRAL_DEC_LAYERS,
+            /*.mem_buffer=*/ nullptr,
+            /*.no_alloc  =*/ true,
+        };
+        ctx->ctx_ada_scales = ggml_init(ada_p);
+        ctx->ada_scales.resize(VOXTRAL_DEC_LAYERS);
+
+        for (int32_t i = 0; i < VOXTRAL_DEC_LAYERS; ++i) {
+            ctx->ada_scales[i] = ggml_new_tensor_1d(ctx->ctx_ada_scales, GGML_TYPE_F32, VOXTRAL_DEC_DIM);
+            char nm[64];
+            snprintf(nm, sizeof(nm), "ada_scale_%d", i);
+            ggml_set_name(ctx->ada_scales[i], nm);
+        }
+
+        ctx->buf_ada_scales = ggml_backend_alloc_ctx_tensors(ctx->ctx_ada_scales, ctx->backend);
+        if (!ctx->buf_ada_scales) {
+            LOG_ERR(ctx, "failed to allocate ada_scales buffer");
+            voxtral_free(ctx);
+            return nullptr;
+        }
+
+        // Compute ada_scale[i] = ada2_weight @ gelu(ada0_weight @ time_emb) on CPU
+        for (int32_t i = 0; i < VOXTRAL_DEC_LAYERS; ++i) {
+            auto & L = model->dec_layers[i];
+
+            // Read ada weights to CPU (they may be quantized on GPU)
+            const size_t ada0_bytes = ggml_nbytes(L.ada0_weight);
+            const size_t ada2_bytes = ggml_nbytes(L.ada2_weight);
+            std::vector<uint8_t> ada0_raw(ada0_bytes);
+            std::vector<uint8_t> ada2_raw(ada2_bytes);
+            ggml_backend_tensor_get(L.ada0_weight, ada0_raw.data(), 0, ada0_bytes);
+            ggml_backend_tensor_get(L.ada2_weight, ada2_raw.data(), 0, ada2_bytes);
+
+            // Dequantize ada0: [ada_dim, dec_dim] and ada2: [dec_dim, ada_dim]
+            std::vector<float> ada0_f32((size_t)VOXTRAL_ADA_NORM_DIM * VOXTRAL_DEC_DIM);
+            std::vector<float> ada2_f32((size_t)VOXTRAL_DEC_DIM * VOXTRAL_ADA_NORM_DIM);
+
+            if (L.ada0_weight->type == GGML_TYPE_F32) {
+                memcpy(ada0_f32.data(), ada0_raw.data(), ada0_bytes);
+            } else if (L.ada0_weight->type == GGML_TYPE_F16) {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *)ada0_raw.data(), ada0_f32.data(),
+                    (int64_t)ada0_f32.size());
+            } else {
+                // Quantized: dequantize row by row
+                const auto dequant = ggml_get_type_traits(L.ada0_weight->type)->to_float;
+                if (dequant) {
+                    dequant(ada0_raw.data(), ada0_f32.data(), (int64_t)ada0_f32.size());
+                }
+            }
+
+            if (L.ada2_weight->type == GGML_TYPE_F32) {
+                memcpy(ada2_f32.data(), ada2_raw.data(), ada2_bytes);
+            } else if (L.ada2_weight->type == GGML_TYPE_F16) {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *)ada2_raw.data(), ada2_f32.data(),
+                    (int64_t)ada2_f32.size());
+            } else {
+                const auto dequant = ggml_get_type_traits(L.ada2_weight->type)->to_float;
+                if (dequant) {
+                    dequant(ada2_raw.data(), ada2_f32.data(), (int64_t)ada2_f32.size());
+                }
+            }
+
+            // hidden = ada0_weight @ time_emb → [ada_dim]
+            // ada0 layout in ggml: ne[0]=ada_dim(32), ne[1]=dec_dim(3072) for mul_mat
+            // ggml_mul_mat(A[K,N], B[K,M]) → C[N,M] where K=inner dim
+            // ada0_weight: ne=[32, 3072], time_emb: ne=[3072]
+            // So in memory: ada0[row i] = ada0_f32[i * 3072 .. (i+1)*3072], 32 rows of 3072 each
+            // Actually, ggml stores tensors row-major with ne[0] being the fastest dimension.
+            // For ada0_weight[32, 3072]: ne[0]=32, stride along ne[0] is contiguous
+            // In ggml_mul_mat, ne[0] is the K (contraction) dimension
+            // So effectively: for each output j (0..N-1), output[j] = sum_k(A[k,j] * B[k])
+            // Where A.ne[0]=K=32, A.ne[1]=N=3072, B.ne[0]=K=32... wait no.
+            // Actually ada0_weight shape is [ada_dim, dec_dim] = [32, 3072]
+            // ggml_mul_mat(ada0_weight, time_emb) → contract over ne[0]=32? No...
+            // In ggml, ggml_mul_mat(A, B) computes A^T @ B
+            // A: [ne0_A, ne1_A], B: [ne0_B, ne1_B]
+            // Result: [ne1_A, ne1_B] where ne0_A == ne0_B (contraction dim)
+            // So for ada0[32, 3072] @ time_emb[3072, 1]:
+            // ne0_A=32, ne1_A=3072, ne0_B=3072 → mismatch! ne0_A != ne0_B
+            // Wait... looking at the code: ggml_mul_mat(L.ada0_weight, time_emb)
+            // L.ada0_weight shape is [ada_dim, dec_dim] which in ggml is ne[0]=ada_dim=32, ne[1]=dec_dim=3072
+            // time_emb shape is [dec_dim] = ne[0]=3072
+            // For ggml_mul_mat: ne[0] of both must match. 32 != 3072... that doesn't work.
+            // Unless the weight shapes are different from what I assumed.
+
+            // Let me re-read: ada0_weight is declared as // [ada_dim, dec_dim]
+            // But in GGML, tensors are stored with ne[0] as first dimension.
+            // Looking at how they're loaded from GGUF: snprintf(nm,sizeof(nm),"dec.blk.%d.ada0.weight",i)
+            // The GGUF tensor shape might be [dec_dim, ada_dim] in ggml convention
+            // (i.e., ne[0]=dec_dim=3072, ne[1]=ada_dim=32)
+            // Because ggml_mul_mat(W, x) requires W.ne[0] == x.ne[0]
+            // So ada0_weight.ne[0]=3072, ada0_weight.ne[1]=32 (32 output features)
+            // Output of ada0@time_emb: [32] (ne[1] of W)
+
+            // For our CPU computation:
+            // ada0 stored as [ne0=3072, ne1=32]: 32 rows of 3072 elements each
+            // hidden[j] = sum_k(ada0[k + j*3072] * time_emb[k]) for j=0..31
+
+            const int32_t ada_dim = VOXTRAL_ADA_NORM_DIM;
+            const int32_t dec_dim = VOXTRAL_DEC_DIM;
+
+            std::vector<float> hidden(ada_dim, 0.0f);
+            for (int32_t j = 0; j < ada_dim; ++j) {
+                float sum = 0.0f;
+                for (int32_t k = 0; k < dec_dim; ++k) {
+                    sum += ada0_f32[(size_t)j * dec_dim + k] * ctx->time_emb_cpu[k];
+                }
+                // GELU activation
+                hidden[j] = 0.5f * sum * (1.0f + erff(sum / sqrtf(2.0f)));
+            }
+
+            // scale = ada2_weight @ hidden → [dec_dim]
+            // ada2_weight: ne[0]=ada_dim=32, ne[1]=dec_dim=3072 (3072 output features)
+            // Wait, same logic: ggml_mul_mat(ada2_weight, hidden)
+            // ada2_weight.ne[0] == hidden.ne[0] for contraction
+            // ada2 declared as [dec_dim, ada_dim], but ggml stores ne[0] first
+            // So ada2.ne[0] must match hidden dim. hidden is [32].
+            // → ada2.ne[0]=32, ada2.ne[1]=3072 → but comment says [dec_dim, ada_dim]
+            // That means ne[0]=dec_dim... hmm, conflicting.
+            //
+            // Let me just check: ggml_mul_mat(ada2_weight, ada_hidden) where ada_hidden=[32]
+            // For this to work: ada2.ne[0] must == ada_hidden.ne[0] = 32
+            // So ada2.ne[0]=32, ada2.ne[1]=3072
+            // In memory: 3072 rows of 32 elements each
+            // scale[j] = sum_k(ada2[k + j*32] * hidden[k]) for j=0..3071
+
+            std::vector<float> scale(dec_dim, 0.0f);
+            for (int32_t j = 0; j < dec_dim; ++j) {
+                float sum = 0.0f;
+                for (int32_t k = 0; k < ada_dim; ++k) {
+                    sum += ada2_f32[(size_t)j * ada_dim + k] * hidden[k];
+                }
+                scale[j] = sum;
+            }
+
+            ggml_backend_tensor_set(ctx->ada_scales[i], scale.data(), 0, dec_dim * sizeof(float));
+        }
+        LOG_INFO(ctx, "ada_scale pre-computed for %d decoder layers", VOXTRAL_DEC_LAYERS);
+    }
+
     LOG_INFO(ctx, "context initialized");
     return ctx;
 }
@@ -1031,6 +1229,8 @@ void voxtral_free(voxtral_context * ctx) {
     if (ctx->sched_adapter)  ggml_backend_sched_free(ctx->sched_adapter);
     if (ctx->sched_dec_pre)  ggml_backend_sched_free(ctx->sched_dec_pre);
     if (ctx->sched_dec_step) ggml_backend_sched_free(ctx->sched_dec_step);
+    if (ctx->buf_ada_scales) ggml_backend_buffer_free(ctx->buf_ada_scales);
+    if (ctx->ctx_ada_scales) ggml_free(ctx->ctx_ada_scales);
     if (ctx->buf_persistent) ggml_backend_buffer_free(ctx->buf_persistent);
     if (ctx->ctx_persistent) ggml_free(ctx->ctx_persistent);
     if (ctx->backend_cpu)    ggml_backend_free(ctx->backend_cpu);
@@ -1776,7 +1976,6 @@ static ggml_cgraph * build_decoder_step_token_only_bucket_graph(
     ggml_set_name(cache->attn_mask, "attn_mask");
     ggml_backend_sched_set_tensor_backend(ctx->sched_dec_step, cache->attn_mask, ctx->backend);
 
-    ggml_tensor * time_emb = ctx->decoder_time_emb;
     ggml_tensor * tok_emb = ggml_get_rows(gctx, model->tok_embeddings_weight, cache->token_id);
     ggml_tensor * audio_emb = ggml_get_rows(gctx, ctx->decoder_memory, cache->audio_idx);
     ggml_tensor * x = ggml_add(gctx, tok_emb, audio_emb);
@@ -1804,7 +2003,6 @@ static ggml_cgraph * build_decoder_step_token_only_bucket_graph(
 
         q = ggml_cont(gctx, ggml_reshape_2d(gctx, q, VOXTRAL_DEC_HEADS * VOXTRAL_DEC_HEAD_DIM, 1));
         k = ggml_cont(gctx, ggml_reshape_2d(gctx, k, kv_dim, 1));
-        v = ggml_cont(gctx, v);
 
         ggml_tensor * k_cache = ggml_view_2d(gctx, ctx->kv_self_k,
             kv_dim, kv_cap,
@@ -1844,10 +2042,8 @@ static ggml_cgraph * build_decoder_step_token_only_bucket_graph(
         ggml_tensor * h_norm = ggml_rms_norm(gctx, x, VOXTRAL_DEC_NORM_EPS);
         h_norm = ggml_mul(gctx, h_norm, L.ffn_norm_weight);
 
-        ggml_tensor * ada_hidden = ggml_mul_mat(gctx, L.ada0_weight, time_emb);
-        ada_hidden = ggml_gelu_erf(gctx, ada_hidden);
-        ggml_tensor * ada_scale = ggml_mul_mat(gctx, L.ada2_weight, ada_hidden);
-        ggml_tensor * scaled = ggml_mul(gctx, h_norm, ada_scale);
+        // Use pre-computed ada_scale (constant since time_emb is fixed)
+        ggml_tensor * scaled = ggml_mul(gctx, h_norm, ctx->ada_scales[i]);
         h_norm = ggml_add(gctx, h_norm, scaled);
 
         ggml_tensor * gate = ggml_mul_mat(gctx, L.ffn_w1_weight, h_norm);
