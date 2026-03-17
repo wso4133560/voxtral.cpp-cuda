@@ -137,7 +137,7 @@ struct decoder_step_bucket_cache {
     ggml_tensor  * kv_row = nullptr;
     ggml_tensor  * attn_mask = nullptr;
     std::vector<uint8_t> meta_buf;
-    std::vector<float> mask_cpu;
+    std::vector<ggml_fp16_t> mask_cpu;
 };
 
 struct prefill_cache_entry {
@@ -203,7 +203,7 @@ struct voxtral_context {
     int32_t dec_step_active_bucket = -1;
 
     // Pre-computed encoder attention masks for common sequence lengths
-    std::unordered_map<int32_t, std::vector<float>> enc_mask_cache;
+    std::unordered_map<int32_t, std::vector<ggml_fp16_t>> enc_mask_cache;
 
     // Decoder prefill graph cache for common token counts
     std::unordered_map<int32_t, prefill_cache_entry> dec_prefill_cache;
@@ -1237,12 +1237,12 @@ voxtral_context * voxtral_init_from_model(
     {
         const int32_t common_lens[] = {64, 128, 256, 512, 750};
         for (int32_t seq_len : common_lens) {
-            std::vector<float> mask((size_t)seq_len * seq_len);
+            std::vector<ggml_fp16_t> mask((size_t)seq_len * seq_len);
             for (int32_t q = 0; q < seq_len; ++q) {
                 const int32_t min_kv = std::max<int32_t>(0, q - (VOXTRAL_ENC_WINDOW - 1));
                 for (int32_t kv = 0; kv < seq_len; ++kv) {
                     const bool allow = (kv <= q) && (kv >= min_kv);
-                    mask[(size_t)q * seq_len + kv] = allow ? 0.0f : -INFINITY;
+                    mask[(size_t)q * seq_len + kv] = ggml_fp32_to_fp16(allow ? 0.0f : -INFINITY);
                 }
             }
             ctx->enc_mask_cache[seq_len] = std::move(mask);
@@ -1540,7 +1540,7 @@ static ggml_cgraph * build_encoder_graph(
     ggml_backend_sched_set_tensor_backend(ctx->sched_encoder, enc_positions, ctx->backend);
 
     // Encoder attention mask (sliding causal window)
-    ggml_tensor * enc_attn_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, seq_len, seq_len);
+    ggml_tensor * enc_attn_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, seq_len, seq_len);
     ggml_set_name(enc_attn_mask, "enc_attn_mask");
     ggml_backend_sched_set_tensor_backend(ctx->sched_encoder, enc_attn_mask, ctx->backend);
 
@@ -1589,33 +1589,10 @@ static ggml_cgraph * build_encoder_graph(
         // GQA: expand KV heads if needed
         // Encoder: ENC_HEADS == ENC_KV_HEADS == 32, so no expansion needed
 
-        // Compute attention scores: Q @ K^T / sqrt(head_dim)
-        // Q: [head_dim, seq_len, n_heads], K: [head_dim, seq_len, n_kv_heads]
-        // ggml_mul_mat over 3D: for each head, Q[head_dim, seq_q] @ K[head_dim, seq_k] -> [seq_k, seq_q]
-        // This is: K^T @ Q -> [seq_k, seq_q] per head
-        ggml_tensor * scores = ggml_mul_mat(gctx, k, q); // [seq_len, seq_len, n_heads]
-
-        // Apply sliding causal mask + scale + softmax in one op
+        // Flash Attention: fused Q @ K^T * scale + mask -> softmax -> @ V
         const float scale = 1.0f / sqrtf((float)VOXTRAL_ENC_HEAD_DIM);
-        scores = ggml_soft_max_ext(gctx, scores, enc_attn_mask, scale, 0.0f); // [seq_len, seq_len, n_heads]
-
-        // Apply attention: scores @ V
-        // V: [head_dim, seq_len, n_heads]
-        // Need V transposed: [seq_len, head_dim, n_heads]
-        ggml_tensor * v_t = ggml_permute(gctx, v, 1, 0, 2, 3); // [seq_len, head_dim, n_heads]
-        // But actually for ggml_mul_mat: A[K,N] @ B[K,M] -> [N,M]
-        // scores: [seq_len(K), seq_len(Q), n_heads]
-        // v: [head_dim, seq_len(V), n_heads] -> we want result [head_dim, seq_q, n_heads]
-        // Use: ggml_mul_mat(v, scores) -> v has [head_dim, seq_v], scores has [seq_v, seq_q]
-        //   -> but v's ne[0]=head_dim, scores's ne[0]=seq_len, mismatch!
-        // Correct: v_t = ggml_cont(permute(v, 1,0,2,3)) -> [seq_len, head_dim, n_heads]
-        // ggml_mul_mat(v_t, scores): v_t[seq_len, head_dim], scores[seq_len, seq_q] -> [head_dim, seq_q]
-        v_t = ggml_cont(gctx, v_t); // make contiguous [seq_len, head_dim, n_heads]
-        ggml_tensor * attn_out = ggml_mul_mat(gctx, v_t, scores); // [head_dim, seq_len, n_heads]
-
-        // Reshape back: [head_dim, seq_len, n_heads] -> permute to [head_dim, n_heads, seq_len]
-        attn_out = ggml_permute(gctx, attn_out, 0, 2, 1, 3); // [head_dim, n_heads, seq_len]
-        attn_out = ggml_cont(gctx, attn_out);
+        ggml_tensor * attn_out = ggml_flash_attn_ext(gctx, q, k, v, enc_attn_mask, scale, 0.0f, 0.0f);
+        // FA output: [head_dim, n_heads, seq_len] (already permuted)
         attn_out = ggml_reshape_2d(gctx, attn_out, VOXTRAL_ENC_HEADS * VOXTRAL_ENC_HEAD_DIM, seq_len); // [n_heads*head_dim, seq_len]
 
         // Output projection + residual
@@ -1795,29 +1772,10 @@ static ggml_tensor * build_decoder_layer(
     // So if k3 has ne[2]=n_kv_heads=8 and q3 has ne[2]=n_heads=32, ggml_mul_mat
     // will automatically broadcast k3 across groups of 4
 
-    // Scores: K^T @ Q -> [n_kv, n_tokens, n_heads]
-    ggml_tensor * scores = ggml_mul_mat(gctx, k3, q3); // [n_kv, n_tokens, n_heads]
-
-    // Scale + mask + softmax
+    // Flash Attention: fused Q @ K^T * scale + mask -> softmax -> @ V
     const float scale = 1.0f / sqrtf((float)VOXTRAL_DEC_HEAD_DIM);
-
-    if (attn_mask) {
-        // Use ggml_soft_max_ext which combines scale + mask + softmax
-        scores = ggml_soft_max_ext(gctx, scores, attn_mask, scale, 0.0f);
-    } else {
-        // For step graph (n_tokens=1), all KV positions are valid (causal by construction)
-        scores = ggml_soft_max_ext(gctx, scores, nullptr, scale, 0.0f);
-    }
-
-    // Attention output: V @ scores^T
-    // V: [head_dim, n_kv, n_kv_heads], scores: [n_kv, n_tokens, n_heads]
-    // v_t: [n_kv, head_dim, n_kv_heads]
-    ggml_tensor * v_t = ggml_cont(gctx, ggml_permute(gctx, v3, 1, 0, 2, 3)); // [n_kv, head_dim, n_kv_heads]
-    ggml_tensor * attn_out = ggml_mul_mat(gctx, v_t, scores); // [head_dim, n_tokens, n_heads]
-
-    // Reshape: [head_dim, n_tokens, n_heads] -> permute [head_dim, n_heads, n_tokens] -> flatten
-    attn_out = ggml_permute(gctx, attn_out, 0, 2, 1, 3); // [head_dim, n_heads, n_tokens]
-    attn_out = ggml_cont(gctx, attn_out);
+    ggml_tensor * attn_out = ggml_flash_attn_ext(gctx, q3, k3, v3, attn_mask, scale, 0.0f, 0.0f);
+    // FA output: [head_dim, n_heads, n_tokens] (already permuted)
     attn_out = ggml_reshape_2d(gctx, attn_out, VOXTRAL_DEC_HEADS * VOXTRAL_DEC_HEAD_DIM, n_tokens);
 
     // Output projection + residual
@@ -1892,7 +1850,7 @@ static ggml_cgraph * build_decoder_prefill_graph(
 
     // Causal mask for prefill: [n_tokens, n_tokens] additive mask
     // -inf for positions that should not attend
-    ggml_tensor * causal_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, n_tokens, n_tokens);
+    ggml_tensor * causal_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, n_tokens, n_tokens);
     ggml_set_name(causal_mask, "causal_mask");
     ggml_backend_sched_set_tensor_backend(ctx->sched_dec_pre, causal_mask, ctx->backend);
 
@@ -2036,7 +1994,7 @@ static ggml_cgraph * build_decoder_step_token_only_bucket_graph(
     ggml_set_name(cache->kv_row, "kv_row");
     ggml_backend_sched_set_tensor_backend(ctx->sched_dec_step, cache->kv_row, ctx->backend);
 
-    cache->attn_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kv_cap, 1);
+    cache->attn_mask = ggml_new_tensor_2d(gctx, GGML_TYPE_F16, kv_cap, 1);
     ggml_set_name(cache->attn_mask, "attn_mask");
     ggml_backend_sched_set_tensor_backend(ctx->sched_dec_step, cache->attn_mask, ctx->backend);
 
@@ -2089,14 +2047,8 @@ static ggml_cgraph * build_decoder_step_token_only_bucket_graph(
         ggml_tensor * v3 = ggml_reshape_3d(gctx, v_full, VOXTRAL_DEC_HEAD_DIM, VOXTRAL_DEC_KV_HEADS, kv_cap);
         v3 = ggml_permute(gctx, v3, 0, 2, 1, 3);
 
-        ggml_tensor * scores = ggml_mul_mat(gctx, k3, q3);
         const float scale = 1.0f / sqrtf((float) VOXTRAL_DEC_HEAD_DIM);
-        scores = ggml_soft_max_ext(gctx, scores, cache->attn_mask, scale, 0.0f);
-
-        ggml_tensor * v_t = ggml_cont(gctx, ggml_permute(gctx, v3, 1, 0, 2, 3));
-        ggml_tensor * attn_out = ggml_mul_mat(gctx, v_t, scores);
-        attn_out = ggml_permute(gctx, attn_out, 0, 2, 1, 3);
-        attn_out = ggml_cont(gctx, attn_out);
+        ggml_tensor * attn_out = ggml_flash_attn_ext(gctx, q3, k3, v3, cache->attn_mask, scale, 0.0f, 0.0f);
         attn_out = ggml_reshape_2d(gctx, attn_out, VOXTRAL_DEC_HEADS * VOXTRAL_DEC_HEAD_DIM, 1);
 
         ggml_tensor * attn_proj = ggml_mul_mat(gctx, L.attn_o_weight, attn_out);
@@ -2128,7 +2080,7 @@ static ggml_cgraph * build_decoder_step_token_only_bucket_graph(
     ggml_tensor * next_token = ggml_argmax(gctx, logits_2d);
     ggml_build_forward_expand(gf, ggml_cpy(gctx, next_token, ctx->decoder_next_token));
 
-    cache->mask_cpu.assign((size_t) kv_cap, -INFINITY);
+    cache->mask_cpu.assign((size_t) kv_cap, ggml_fp32_to_fp16(-INFINITY));
 
     return gf;
 }
@@ -2255,18 +2207,18 @@ static bool run_encoder(voxtral_context * ctx, const float * mel_data, int32_t n
         auto it = ctx->enc_mask_cache.find(seq_len);
         if (it != ctx->enc_mask_cache.end()) {
             // Use pre-computed mask
-            ggml_backend_tensor_set(mask_t, it->second.data(), 0, it->second.size() * sizeof(float));
+            ggml_backend_tensor_set(mask_t, it->second.data(), 0, it->second.size() * sizeof(ggml_fp16_t));
         } else {
             // Fallback: compute on-the-fly for uncommon lengths
-            std::vector<float> mask((size_t) seq_len * seq_len);
+            std::vector<ggml_fp16_t> mask((size_t) seq_len * seq_len);
             for (int32_t q = 0; q < seq_len; ++q) {
                 const int32_t min_kv = std::max<int32_t>(0, q - (VOXTRAL_ENC_WINDOW - 1));
                 for (int32_t kv = 0; kv < seq_len; ++kv) {
                     const bool allow = (kv <= q) && (kv >= min_kv);
-                    mask[(size_t) q * seq_len + kv] = allow ? 0.0f : -INFINITY;
+                    mask[(size_t) q * seq_len + kv] = ggml_fp32_to_fp16(allow ? 0.0f : -INFINITY);
                 }
             }
-            ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(float));
+            ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
         }
     }
 
@@ -2382,13 +2334,13 @@ static bool run_decoder_prefill(
     // Set causal mask: lower-triangular (0 for allowed, -inf for masked)
     ggml_tensor * mask_t = find_tensor_in_graph(gf, "causal_mask");
     if (mask_t) {
-        std::vector<float> mask(n_tokens * n_tokens);
+        std::vector<ggml_fp16_t> mask(n_tokens * n_tokens);
         for (int32_t i = 0; i < n_tokens; i++) {
             for (int32_t j = 0; j < n_tokens; j++) {
-                mask[i * n_tokens + j] = (j <= i) ? 0.0f : -INFINITY;
+                mask[i * n_tokens + j] = ggml_fp32_to_fp16((j <= i) ? 0.0f : -INFINITY);
             }
         }
-        ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(float));
+        ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
     }
 
     // Compute
@@ -2519,15 +2471,15 @@ static bool run_decoder_step_token_only(
         log_graph_info(ctx, "decoder step(token-only)", bucket->gf);
     }
 
-    std::fill(bucket->mask_cpu.begin(), bucket->mask_cpu.end(), -INFINITY);
-    std::fill_n(bucket->mask_cpu.begin(), required_kv, 0.0f);
+    std::fill(bucket->mask_cpu.begin(), bucket->mask_cpu.end(), ggml_fp32_to_fp16(-INFINITY));
+    std::fill_n(bucket->mask_cpu.begin(), required_kv, ggml_fp32_to_fp16(0.0f));
 
     ggml_backend_tensor_set(bucket->token_id, &token_id, 0, sizeof(int32_t));
     ggml_backend_tensor_set(bucket->position, &position, 0, sizeof(int32_t));
     ggml_backend_tensor_set(bucket->audio_idx, &audio_pos, 0, sizeof(int32_t));
     ggml_backend_tensor_set(bucket->kv_row, &ctx->kv_used, 0, sizeof(int32_t));
     ggml_backend_tensor_set(bucket->attn_mask, bucket->mask_cpu.data(), 0,
-        bucket->mask_cpu.size() * sizeof(float));
+        bucket->mask_cpu.size() * sizeof(ggml_fp16_t));
 
     ggml_backend_sched_graph_compute(ctx->sched_dec_step, bucket->gf);
 
