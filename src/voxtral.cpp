@@ -1225,7 +1225,7 @@ voxtral_context * voxtral_init_from_model(
                 for (int32_t k = 0; k < ada_dim; ++k) {
                     sum += ada2_f32[(size_t)j * ada_dim + k] * hidden[k];
                 }
-                scale[j] = sum;
+                scale[j] = 1.0f + sum;
             }
 
             ggml_backend_tensor_set(ctx->ada_scales[i], scale.data(), 0, dec_dim * sizeof(float));
@@ -2023,8 +2023,11 @@ static ggml_cgraph * build_decoder_step_token_only_bucket_graph(
             VOXTRAL_DEC_HEAD_DIM, 0, 0,
             VOXTRAL_DEC_ROPE_THETA, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-        q = ggml_cont(gctx, ggml_reshape_2d(gctx, q, VOXTRAL_DEC_HEADS * VOXTRAL_DEC_HEAD_DIM, 1));
-        k = ggml_cont(gctx, ggml_reshape_2d(gctx, k, kv_dim, 1));
+        // Q: RoPE output [head_dim, n_heads, 1] → permute directly to FA layout
+        ggml_tensor * q3 = ggml_permute(gctx, q, 0, 2, 1, 3); // [head_dim, 1, n_heads]
+
+        // K: flatten for KV cache write
+        k = ggml_reshape_2d(gctx, k, kv_dim, 1);
 
         ggml_tensor * k_cache = ggml_view_2d(gctx, ctx->kv_self_k,
             kv_dim, kv_cap,
@@ -2037,9 +2040,6 @@ static ggml_cgraph * build_decoder_step_token_only_bucket_graph(
 
         ggml_tensor * k_full = ggml_set_rows(gctx, k_cache, k, cache->kv_row);
         ggml_tensor * v_full = ggml_set_rows(gctx, v_cache, v, cache->kv_row);
-
-        ggml_tensor * q3 = ggml_reshape_3d(gctx, q, VOXTRAL_DEC_HEAD_DIM, VOXTRAL_DEC_HEADS, 1);
-        q3 = ggml_permute(gctx, q3, 0, 2, 1, 3);
 
         ggml_tensor * k3 = ggml_reshape_3d(gctx, k_full, VOXTRAL_DEC_HEAD_DIM, VOXTRAL_DEC_KV_HEADS, kv_cap);
         k3 = ggml_permute(gctx, k3, 0, 2, 1, 3);
@@ -2058,9 +2058,8 @@ static ggml_cgraph * build_decoder_step_token_only_bucket_graph(
         ggml_tensor * h_norm = ggml_rms_norm(gctx, x, VOXTRAL_DEC_NORM_EPS);
         h_norm = ggml_mul(gctx, h_norm, L.ffn_norm_weight);
 
-        // Use pre-computed ada_scale (constant since time_emb is fixed)
-        ggml_tensor * scaled = ggml_mul(gctx, h_norm, ctx->ada_scales[i]);
-        h_norm = ggml_add(gctx, h_norm, scaled);
+        // Use pre-computed ada_factor = 1 + ada_scale (constant since time_emb is fixed)
+        h_norm = ggml_mul(gctx, h_norm, ctx->ada_scales[i]);
 
         ggml_tensor * gate = ggml_mul_mat(gctx, L.ffn_w1_weight, h_norm);
         gate = ggml_silu(gctx, gate);
