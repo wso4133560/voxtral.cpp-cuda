@@ -20,21 +20,29 @@
 
 ## 性能速览
 
-以下数据来自仓库内的本地测试记录，测试时间为 **2026-03-16**，硬件为 **RTX 3080**，模型为 **Voxtral Realtime 4B Q4_0**：
+以下数据来自仓库内的本地测试记录，硬件为 **RTX 3080**，模型为 **Voxtral Realtime 4B Q4_0**：
 
-| 指标 | 结果 |
-|------|------|
-| 优化后吞吐量 | **170.7 tok/s** |
-| 干净环境平均性能 | **168.84 tok/s** |
-| 相比基线提升 | **+30.5%** |
-| KV cache 显存占用 | **-50%** |
-| WER | **0.0000** |
-| 实时性 | **RTF 0.086** |
+| 指标 | 基线 (03-16) | 当前 (03-17) | 变化 |
+|------|-------------|-------------|------|
+| **吞吐量** | 130.8 tok/s | **182.5 tok/s** | **+39.5%** ↑ |
+| **KV cache 显存** | 1744 MB | **872 MB** | **-50%** ↓ |
+| **WER** | 0.000 | **0.000** | 不变 ✓ |
+| **RTF** | 0.112 | **0.080** | **-28.6%** ↓ |
+
+### 优化历程
+
+| 日期 | 优化项 | tok/s | 累计提升 |
+|------|--------|-------|---------|
+| 03-16 | 基线 | 130.8 | — |
+| 03-16 | FP16 KV cache + ada_scale 预计算 + FFT mel | 170.7 | +30.5% |
+| 03-17 | Flash Attention (`ggml_flash_attn_ext`) | 177.3 | +35.5% |
+| 03-17 | ada_scale fuse + Q reshape 消除 | **182.5** | **+39.5%** |
 
 相关文档：
-- [OPTIMIZATION_REPORT.md](/home/tanglin/workspace2/voxtral.cpp-cuda/OPTIMIZATION_REPORT.md)
-- [FINAL_PERFORMANCE_REPORT.md](/home/tanglin/workspace2/voxtral.cpp-cuda/FINAL_PERFORMANCE_REPORT.md)
-- [REALTIME_TRANSCRIPTION.md](/home/tanglin/workspace2/voxtral.cpp-cuda/REALTIME_TRANSCRIPTION.md)
+- [OPTIMIZATION_REPORT.md](OPTIMIZATION_REPORT.md)
+- [FINAL_PERFORMANCE_REPORT.md](FINAL_PERFORMANCE_REPORT.md)
+- [JAPANESE_ASR_ANALYSIS.md](JAPANESE_ASR_ANALYSIS.md)
+- [REALTIME_TRANSCRIPTION.md](REALTIME_TRANSCRIPTION.md)
 
 ## 项目亮点
 
